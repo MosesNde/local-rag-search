@@ -142,7 +142,7 @@ Clone the repository:
 
 ```powershell
 
-git clone https://github.com/YOUR\_USERNAME/local-rag-search.git
+git clone https://github.com/MosesNde/local-rag-search.git
 
 cd local-rag-search
 
@@ -278,6 +278,65 @@ The script extracts content, generates embeddings, and stores records in the per
 
 Previously indexed sources are skipped. Changes to existing sources are not automatically detected or refreshed.
 
+
+## Web Interface
+
+Local RAG Search includes a Streamlit web interface for managing knowledge sources and asking questions.
+
+### Features
+
+- Upload TXT and PDF documents.
+- Upload PNG, JPG, JPEG, and WebP images.
+- Add webpages by entering their URLs.
+- Index new content into the persistent ChromaDB database.
+- Ask questions using a chat-style interface.
+- View AI-generated answers and expandable source references.
+- Clear chat history without deleting indexed documents.
+
+### Launching the application
+
+**Windows — without a terminal**
+
+After completing the installation steps, double-click:
+
+`START_APP.vbs`
+
+The application launches in your default browser at:
+
+http://localhost:8501
+
+To stop the application, double-click:
+
+`STOP_APP.vbs`
+
+The Windows launchers require the project's `.venv` environment and installed dependencies.
+
+**Windows, macOS, and Linux — using a terminal**
+
+From the project root directory, run:
+
+```bash
+python -m streamlit run src/web_app.py
+```
+
+Open http://localhost:8501 if your browser does not open automatically.
+
+### Using the interface
+
+1. Upload documents or enter a webpage URL in the sidebar.
+2. Click **Index content** to process new knowledge sources.
+3. Enter a question in the chat box.
+4. Read the AI-generated answer and expand **Retrieved sources** to inspect the supporting material.
+5. Use **Clear chat** to reset the conversation display.
+
+### Notes
+
+- The application runs locally and requires Ollama and the configured models.
+- Image indexing may take longer because a vision model generates descriptions.
+- Chat history is stored temporarily in the Streamlit session.
+- Questions are answered independently; previous chat messages are not yet used as retrieval context.
+- Uploaded documents and ChromaDB records remain stored locally.
+- The interface is intended for trusted local use, not public internet deployment.
 
 
 ## Asking questions
