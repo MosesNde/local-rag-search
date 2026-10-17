@@ -1,4 +1,4 @@
-\# Local RAG Search Engine
+# Local RAG Search Engine
 
 
 
@@ -10,7 +10,7 @@ The application allows users to index local documents, webpages, and images, the
 
 
 
-\## Features
+## Features
 
 
 
@@ -32,11 +32,11 @@ The application allows users to index local documents, webpages, and images, the
 
 
 
-\## Architecture
+## Architecture
 
 
 
-\### Indexing
+### Indexing
 
 
 
@@ -64,7 +64,7 @@ Image descriptions are initially stored as one record per image.
 
 
 
-\### Question answering
+### Question answering
 
 
 
@@ -98,7 +98,7 @@ Answer + retrieved sources
 
 
 
-\## Requirements
+## Requirements
 
 
 
@@ -184,11 +184,11 @@ The indexer creates the required local data directories automatically.
 
 
 
-\## Adding content
+## Adding content
 
 
 
-\### TXT and PDF
+### TXT and PDF
 
 
 
@@ -204,7 +204,7 @@ data/documents/
 
 
 
-\### Images
+### Images
 
 
 
@@ -224,7 +224,7 @@ Images are processed by the local vision model. The resulting descriptions are e
 
 
 
-\### Webpages
+### Webpages
 
 
 
@@ -256,7 +256,7 @@ Only add URLs whose content you are permitted to retrieve and index.
 
 
 
-\## Indexing content
+## Indexing content
 
 
 
@@ -280,7 +280,7 @@ Previously indexed sources are skipped. Changes to existing sources are not auto
 
 
 
-\## Asking questions
+## Asking questions
 
 
 
@@ -348,7 +348,7 @@ These were controlled experiments on a small collection, not a comprehensive ben
 
 
 
-\## Known limitations
+## Known limitations
 
 
 
@@ -370,7 +370,7 @@ These were controlled experiments on a small collection, not a comprehensive ben
 
 
 
-\## Privacy and local operation
+## Privacy and local operation
 
 
 
@@ -382,7 +382,7 @@ The project's local documents, images, URL list, virtual environment, and Chroma
 
 
 
-\## Future improvements
+## Future improvements
 
 
 
@@ -398,7 +398,7 @@ The project's local documents, images, URL list, virtual environment, and Chroma
 
 
 
-\## Project status
+## Project status
 
 
 
