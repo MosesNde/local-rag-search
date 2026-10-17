@@ -1,0 +1,410 @@
+\# Local RAG Search Engine
+
+
+
+A locally running Retrieval-Augmented Generation (RAG) search engine built with Python, Ollama, and ChromaDB.
+
+
+
+The application allows users to index local documents, webpages, and images, then ask questions using a local language model. Retrieved content provides context for grounded answers, with source references and insufficient-information handling.
+
+
+
+\## Features
+
+
+
+\- \*\*Multiple input formats:\*\* TXT, PDF, JPG, JPEG, PNG, WebP, and webpages.
+
+\- \*\*Local embeddings:\*\* Uses `nomic-embed-text`.
+
+\- \*\*Persistent vector database:\*\* Stores embeddings, text chunks, and metadata in ChromaDB.
+
+\- \*\*Local answer generation:\*\* Uses `qwen3:8b`.
+
+\- \*\*Image understanding:\*\* Uses `qwen2.5vl:3b` to generate searchable image descriptions.
+
+\- \*\*Source tracking:\*\* Displays filenames, PDF page numbers, and retrieved chunk numbers.
+
+\- \*\*Answer rejection:\*\* Uses a distance threshold and grounded-generation instructions to handle insufficient information.
+
+\- \*\*Incremental additions:\*\* Skips sources already present in the database.
+
+
+
+\## Architecture
+
+
+
+\### Indexing
+
+
+
+```text
+
+TXT documents ────────────────┐
+
+PDF documents → Text extraction│
+
+Webpage URLs → HTML extraction ├→ Text chunks
+
+Images → Vision model ────────┘       ↓
+
+&#x20;                              nomic-embed-text
+
+&#x20;                                     ↓
+
+&#x20;                                  ChromaDB
+
+```
+
+
+
+Image descriptions are initially stored as one record per image.
+
+
+
+\### Question answering
+
+
+
+```text
+
+User question
+
+&#x20;    ↓
+
+nomic-embed-text
+
+&#x20;    ↓
+
+ChromaDB retrieves 10 chunks
+
+&#x20;    ↓
+
+Distance threshold
+
+&#x20;    ↓
+
+Qwen3 generates an answer
+
+or rejects insufficient context
+
+&#x20;    ↓
+
+Answer + retrieved sources
+
+```
+
+
+
+\## Requirements
+
+
+
+\- Python 3.14 (development environment)
+
+\- Ollama installed and running
+
+\- Enough available memory to run the local models
+
+\- Internet access for downloading models and indexing webpages
+
+
+
+Install Ollama from https://ollama.com.
+
+
+
+Download the required models:
+
+
+
+```powershell
+
+ollama pull nomic-embed-text
+
+ollama pull qwen3:8b
+
+ollama pull qwen2.5vl:3b
+
+```
+
+
+
+\## Installation
+
+
+
+Clone the repository:
+
+
+
+```powershell
+
+git clone https://github.com/YOUR\_USERNAME/local-rag-search.git
+
+cd local-rag-search
+
+```
+
+
+
+Replace `YOUR\_USERNAME` with the GitHub username where you publish the project.
+
+
+
+Create and activate a virtual environment on Windows:
+
+
+
+```powershell
+
+python -m venv .venv
+
+.\\.venv\\Scripts\\Activate.ps1
+
+```
+
+
+
+Install Python dependencies:
+
+
+
+```powershell
+
+python -m pip install -r requirements.txt
+
+```
+
+
+
+The indexer creates the required local data directories automatically.
+
+
+
+\## Adding content
+
+
+
+\### TXT and PDF
+
+
+
+Place files inside:
+
+
+
+```text
+
+data/documents/
+
+```
+
+
+
+\### Images
+
+
+
+Place JPG, JPEG, PNG, or WebP images inside:
+
+
+
+```text
+
+data/images/
+
+```
+
+
+
+Images are processed by the local vision model. The resulting descriptions are embedded and indexed for text-based retrieval.
+
+
+
+\### Webpages
+
+
+
+Create:
+
+
+
+```text
+
+data/urls.txt
+
+```
+
+
+
+Add one webpage URL per line:
+
+
+
+```text
+
+https://docs.python.org/3/tutorial/introduction.html
+
+```
+
+
+
+Only add URLs whose content you are permitted to retrieve and index.
+
+
+
+\## Indexing content
+
+
+
+Run:
+
+
+
+```powershell
+
+python .\\src\\index\_documents.py
+
+```
+
+
+
+The script extracts content, generates embeddings, and stores records in the persistent ChromaDB collection named `documents`.
+
+
+
+Previously indexed sources are skipped. Changes to existing sources are not automatically detected or refreshed.
+
+
+
+\## Asking questions
+
+
+
+Run:
+
+
+
+```powershell
+
+python .\\src\\query\_documents.py
+
+```
+
+
+
+Example:
+
+
+
+```text
+
+Enter your question: How do you write comments in Python?
+
+
+
+Answer:
+
+Comments in Python begin with the # character and extend to the end of the line.
+
+
+
+Retrieved sources:
+
+\- https://docs.python.org/3/tutorial/introduction.html (chunk 4)
+
+```
+
+
+
+The output identifies retrieved sources. These references do not guarantee that every generated claim is supported by every listed chunk.
+
+
+
+\## Evaluation
+
+
+
+During development, a small evaluation set containing 10 questions was used to study retrieval acceptance and rejection.
+
+
+
+| Approach | Acceptance/rejection accuracy |
+
+|---|---:|
+
+| Distance threshold alone | 70% |
+
+| Separate Qwen3 answerability check | 100% |
+
+| Single-call Qwen3 grounded generation | 100% |
+
+
+
+These were controlled experiments on a small collection, not a comprehensive benchmark. The single-call evaluation primarily measured whether questions were accepted or rejected, not the full factual correctness of generated answers.
+
+
+
+\## Known limitations
+
+
+
+\- PDF extraction uses heuristic layout processing and may mishandle complex tables, figures, or multi-column documents.
+
+\- Image descriptions generated by the vision model may miss or misinterpret visual details.
+
+\- Current text chunking is simple and may split abbreviations, URLs, and code.
+
+\- The retrieval distance threshold is experimental.
+
+\- Retrieving 10 chunks may introduce irrelevant context.
+
+\- Modified or deleted sources are not automatically synchronized with ChromaDB.
+
+\- Local inference can be slow on CPU-only hardware.
+
+\- The application currently uses a command-line interface rather than a graphical interface.
+
+
+
+\## Privacy and local operation
+
+
+
+Embeddings, indexed content, and answer generation are handled locally through Ollama and ChromaDB. Webpage indexing requires external HTTP requests, and downloading dependencies or models requires network access.
+
+
+
+The project's local documents, images, URL list, virtual environment, and ChromaDB data are excluded from version control through `.gitignore`.
+
+
+
+\## Future improvements
+
+
+
+\- Refresh and delete outdated indexed records.
+
+\- Improve chunking and PDF layout extraction.
+
+\- Add reranking and more precise evidence attribution.
+
+\- Expand retrieval and answer-quality evaluations.
+
+\- Build a graphical interface for document management and search.
+
+
+
+\## Project status
+
+
+
+\*\*Version 1 — Functional command-line prototype\*\*
+
+
+
+Supports TXT, PDF, webpage, and image-based knowledge retrieval using locally running models.
+

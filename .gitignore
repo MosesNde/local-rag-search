@@ -1,7 +1,34 @@
+
+# Python environment
 .venv/
 __pycache__/
 *.pyc
-.env
 
+# Secrets
+.env
+.env.*
+
+# Local documents and images
 data/documents/*
+data/images/*
+
+# Persistent vector database
 data/chroma/*
+
+# Local URL list
+data/urls.txt
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local learning experiments
+src/main.py
+src/chunking_test.py
+src/chunk_retrieval_test.py
+src/pdf_extraction_test.py
+src/url_extraction_test.py
+src/image_extraction_test.py
+src/evaluate_retrieval.py
