@@ -1,5 +1,6 @@
 """Streamlit interface for Local RAG Search with message-scoped citations."""
 import re
+import html
 from difflib import SequenceMatcher
 import subprocess
 import sys
@@ -279,6 +280,109 @@ def pdf_page_png(name, page, modified_ns, table_label=None, row_number=None, chu
         return png, len(document), highlighted, highlight_type, category
 
 
+
+def parse_txt_chunk_locator(source):
+    """Return exact TXT filename and cited chunk, never a guessed chunk."""
+    if not PREFIX.match(source):
+        return None  # unverified retrieved context must not masquerade as a citation
+    name = get_source_name(source)
+    if not name.lower().endswith('.txt') or '/' in name or "\\" in name:
+        return None
+    match = re.search(r'\bchunk\s+(\d+)\b', source, re.I)
+    return (name, int(match.group(1))) if match else None
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def indexed_txt_chunk(name, number):
+    """Read-only lookup of the exact indexed chunk."""
+    db = chromadb.PersistentClient(path=str(DB_PATH))
+    collection = db.get_collection('documents')
+    records = collection.get(where={'$and': [
+        {'source': name}, {'file_type': 'txt'}, {'chunk_number': number},
+    ]}, include=['documents', 'metadatas'])
+    chunks = records.get('documents') or []
+    return chunks[0] if len(chunks) == 1 else None
+
+
+def normalized_with_positions(text):
+    """Collapse whitespace while retaining offsets in the original document."""
+    chars, offsets, pending_space = [], [], False
+    for index, char in enumerate(text):
+        if char.isspace():
+            pending_space = bool(chars)
+            continue
+        if pending_space:
+            chars.append(' ')
+            offsets.append(index)
+            pending_space = False
+        chars.append(char.casefold())
+        offsets.append(index)
+    return ''.join(chars), offsets
+
+
+def match_txt_chunk(document, chunk):
+    """Return reliable (start, end) offsets of a chunk in the TXT file.
+
+    Prefer full, unique normalized match; otherwise accept a single substantial
+    exact sequence. Never infer a position from the chunk index alone.
+    """
+    original, positions = normalized_with_positions(document)
+    needle, _ = normalized_with_positions(chunk)
+    if not needle or not original:
+        return None
+    index = original.find(needle)
+    if index >= 0 and original.find(needle, index + 1) == -1:
+        return positions[index], positions[index + len(needle) - 1] + 1
+    # Indexer sentence overlaps and text normalization can prevent a full match.
+    matcher = SequenceMatcher(None, original, needle, autojunk=False)
+    best = matcher.find_longest_match(0, len(original), 0, len(needle))
+    if best.size < 80 or best.size < len(needle) * .35:
+        return None
+    segment = original[best.a:best.a + best.size]
+    if original.find(segment, best.a + 1) != -1:
+        return None
+    return positions[best.a], positions[best.a + best.size - 1] + 1
+
+
+def show_txt_highlight(source, path):
+    """Highlight cited text in the original TXT, or show a clear fallback."""
+    locator = parse_txt_chunk_locator(source)
+    document = path.read_text(encoding='utf-8', errors='replace')
+    st.caption(f'Text document: {path.name}')
+    if not locator:
+        st.text_area('Document content (preview)', document[:12000],
+                     height=380, disabled=True)
+        return
+    try:
+        chunk = indexed_txt_chunk(*locator)
+    except Exception as exc:
+        st.info(f'Could not retrieve the indexed text chunk ({type(exc).__name__}).')
+        chunk = None
+    match = match_txt_chunk(document, chunk) if chunk else None
+    if match:
+        left, right = match
+        # Show the surrounding document, without creating an enormous HTML block.
+        start, end = max(0, left - 900), min(len(document), right + 900)
+        if end - start > 18000:
+            end = min(len(document), left + 16000)
+        before = html.escape(document[start:left])
+        marked = html.escape(document[left:min(right, end)])
+        after = html.escape(document[min(right, end):end])
+        body = before + '<mark style="background-color:#ffe082;color:#222;">' + marked + '</mark>' + after
+        st.success(f'Highlighted cited chunk {locator[1]} in the original document.')
+        st.markdown('<div style="white-space:pre-wrap;overflow-wrap:anywhere;'
+                    'max-height:520px;overflow-y:auto;line-height:1.6;'
+                    'padding:12px;border:1px solid #9995;border-radius:8px;">'
+                    + body + '</div>', unsafe_allow_html=True)
+    else:
+        st.info('The indexed chunk could not be located reliably in the original '
+                'TXT file. No highlight was added.')
+        if chunk:
+            st.text_area(f'Indexed chunk {locator[1]} (reference only)',
+                         chunk, height=200, disabled=True)
+        st.text_area('Original document preview', document[:12000],
+                     height=260, disabled=True)
+
 def show_evidence(selection):
     """Always show the source selected from its original assistant message."""
     if not selection:
@@ -327,11 +431,7 @@ def show_evidence(selection):
     name = get_source_name(source)
     path = local_source_file(name)
     if path and path.suffix.lower() == '.txt':
-        st.caption(f'Text document: {path.name}')
-        st.text_area('Document content (preview)',
-                     path.read_text(encoding='utf-8', errors='replace')[:12000],
-                     height=380, disabled=True,
-                     key=f"txt_{selection['message_id']}_{selection['citation_number']}")
+        show_txt_highlight(source, path)
     elif path and path.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
         st.caption(f'Image: {path.name}')
         st.image(str(path), use_container_width=True)
