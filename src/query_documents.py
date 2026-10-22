@@ -419,6 +419,146 @@ def build_context(records, character_limit):
     return "\n\n".join(parts), used
 
 
+# Conservative extractive citation matching. This checks term overlap and exact
+# numeric tokens; it is not an entailment model or a factuality guarantee.
+CITATION_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "to", "of", "in", "on", "for",
+    "with", "by", "is", "are", "was", "were", "be", "been", "that", "this",
+    "these", "those", "it", "its", "as", "at", "from", "which", "who", "can",
+    "then", "also", "into", "using", "use", "uses", "used", "through", "their",
+    "them", "they", "such", "each", "when", "how", "does", "what", "will",
+}
+
+
+def normalized_evidence_tokens(text):
+    """Normalize frequent grammatical variants for conservative lexical matching."""
+    words = re.findall(r"[a-z0-9]+(?:[.+_-][a-z0-9]+)*", text.casefold())
+    terms = []
+    for word in words:
+        if len(word) <= 2 or word in CITATION_STOPWORDS:
+            continue
+        # Limited inflection rules rather than broad semantic assumptions.
+        if word.endswith("ing") and len(word) > 6:
+            stem = word[:-3]
+            if len(stem) > 2 and stem[-1] == stem[-2]:
+                stem = stem[:-1]
+            word = stem
+        elif word.endswith("es") and len(word) > 5 and word[-3] in "shxz":
+            word = word[:-2]
+        elif word.endswith("s") and len(word) > 4 and not word.endswith("ss"):
+            word = word[:-1]
+        terms.append(word)
+    return terms
+
+
+def evidence_terms(text):
+    return set(normalized_evidence_tokens(text))
+
+
+def evidence_match_score(sentence, document):
+    """Score a paraphrase only when substantial sentence content matches.
+
+    A short high-overlap clause is useful, but it cannot stand in for an
+    otherwise unsupported sentence: whole-sentence coverage is also required.
+    """
+    tokens = normalized_evidence_tokens(sentence)
+    terms = set(tokens)
+    dterms = evidence_terms(document)
+    shared = terms & dterms
+    if len(shared) < 4 or not terms:
+        return None
+    whole_coverage = len(shared) / len(terms)
+    if whole_coverage < 0.48:
+        return None
+    # Find a meaningful contiguous clause/window in the original answer.
+    best_window = 0.0
+    for width in range(4, min(10, len(tokens)) + 1):
+        for start in range(len(tokens) - width + 1):
+            window = set(tokens[start:start + width])
+            if len(window) < 4:
+                continue
+            coverage = len(window & dterms) / len(window)
+            if len(window & dterms) >= 4:
+                best_window = max(best_window, coverage)
+    if whole_coverage >= 0.70:
+        return whole_coverage + 0.05 * best_window
+    if best_window >= 0.80 and whole_coverage >= 0.48:
+        return whole_coverage + 0.05 * best_window
+    return None
+
+
+def annotate_answer_with_evidence(answer, records, used_metadata):
+    """Annotate supported sentences using text included in the query context.
+
+    Lexical evidence matching is a useful heuristic, not proof of entailment.
+    No citation is added if a supporting passage cannot be identified.
+    """
+    candidates = []
+    for meta in used_metadata:
+        matched = next(((doc, m) for doc, m in records if m is meta), None)
+        if matched is None:
+            matched = next(((doc, m) for doc, m in records if m == meta), None)
+        if matched:
+            candidates.append(matched)
+
+    # Adjacent indexed chunks intentionally repeat a sentence. For citation
+    # attribution, credit that sentence to its FIRST available occurrence,
+    # rather than a later chunk that merely contains the overlap.
+    # Only trim against passages actually included in the generated context.
+    by_position = {}
+    for doc, meta in candidates:
+        if meta.get("file_type") not in {"txt", "pdf"}:
+            continue
+        n = meta.get("chunk_number")
+        if isinstance(n, int):
+            key = (meta.get("source"), meta.get("file_type"), meta.get("page"), n)
+            by_position.setdefault(key, doc)
+
+    citation_candidates = []
+    for doc, meta in candidates:
+        n = meta.get("chunk_number")
+        if meta.get("file_type") in {"txt", "pdf"} and isinstance(n, int) and n > 0:
+            predecessor = by_position.get((meta.get("source"), meta.get("file_type"),
+                                           meta.get("page"), n - 1))
+            if predecessor:
+                doc = remove_repeated_chunk_overlap(doc, predecessor)
+        citation_candidates.append((doc, meta))
+
+    segments = re.split(r"(?<=[.!?])\s+(?=[A-Z])", answer)
+    result, citations, ids = [], [], {}
+    for sentence in segments:
+        original = sentence.strip()
+        if not original:
+            continue
+        numeric = set(re.findall(r"(?<![\w])\d+(?:\.\d+)?(?:%|\+)?", original))
+        scored = []
+        for doc, meta in citation_candidates:
+            nums_doc = set(re.findall(r"(?<![\w])\d+(?:\.\d+)?(?:%|\+)?", doc))
+            if numeric and not numeric.issubset(nums_doc):
+                continue
+            score = evidence_match_score(original, doc)
+            if score is not None:
+                scored.append((score, doc, meta))
+        if not scored:
+            result.append(original)
+            continue
+        # When lexical support is equivalent, cite the earlier original chunk.
+        # The explicit overlap removal above prevents a later chunk from
+        # claiming a repeated leading sentence just because it was retrieved first.
+        scored.sort(key=lambda item: (-item[0],
+                                      item[2].get("chunk_number") if isinstance(item[2].get("chunk_number"), int) else 10**9))
+        _, _, metadata = scored[0]
+        source_key = (metadata.get("source"), metadata.get("file_type"),
+                      metadata.get("page"), metadata.get("table_number"),
+                      metadata.get("table_label"), metadata.get("figure_number"),
+                      metadata.get("chunk_number"), metadata.get("row_number"))
+        if source_key not in ids:
+            ids[source_key] = len(ids) + 1
+            citations.append(f"[{ids[source_key]}] {format_source(metadata)}")
+        result.append(original + f" [{ids[source_key]}]")
+    return " ".join(result), citations
+
+
 def generate_grounded_answer(question, context):
     prompt = (
         "Answer using ONLY the retrieved context. If the evidence is insufficient, "
@@ -621,7 +761,8 @@ def answer_question(question):
         profile_log("total=" + seconds(total_started))
         if answer == "INSUFFICIENT_INFORMATION" or not answer:
             return INSUFFICIENT_MESSAGE, []
-        return answer, list(dict.fromkeys(
+        cited_answer, matched_sources = annotate_answer_with_evidence(answer, records, used)
+        return cited_answer, matched_sources or list(dict.fromkeys(
             format_source(meta) for meta in used if meta.get("source")
         ))
 
@@ -653,10 +794,11 @@ def answer_question(question):
         profile_log(f"stage={stage_number} sufficient={sufficient} answer_chars={len(answer)}")
         if sufficient:
             profile_log(f"expanded={stage_number > 1} total={seconds(total_started)}")
-            sources = list(dict.fromkeys(
+            cited_answer, matched_sources = annotate_answer_with_evidence(answer, records, used)
+            sources = matched_sources or list(dict.fromkeys(
                 format_source(meta) for meta in used if meta.get("source")
             ))
-            return answer, sources
+            return cited_answer, sources
     profile_log("no_sufficient_answer total=" + seconds(total_started))
     return INSUFFICIENT_MESSAGE, []
 
