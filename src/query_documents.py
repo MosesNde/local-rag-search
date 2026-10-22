@@ -480,9 +480,10 @@ def evidence_match_score(sentence, document):
             coverage = len(window & dterms) / len(window)
             if len(window & dterms) >= 4:
                 best_window = max(best_window, coverage)
-    if whole_coverage >= 0.70:
-        return whole_coverage + 0.05 * best_window
-    if best_window >= 0.80 and whole_coverage >= 0.48:
+    # A strong matching clause alone is not enough: a sentence may contain
+    # additional claims that require other passages. Require most of the
+    # *whole sentence* to be covered before crediting one source.
+    if whole_coverage >= 0.83:
         return whole_coverage + 0.05 * best_window
     return None
 
