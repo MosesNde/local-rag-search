@@ -487,6 +487,62 @@ def evidence_match_score(sentence, document):
     return None
 
 
+def multi_evidence_matches(sentence, candidates, max_sources=3):
+    """Find complementary passages when no single passage supports a sentence.
+
+    Requires high combined lexical coverage, significant *new* terms from each
+    added passage, and consistent numeric evidence. This does not establish
+    logical entailment or verify that claims are true.
+    """
+    terms = evidence_terms(sentence)
+    if len(terms) < 7:
+        return []
+    numeric = set(re.findall(r"(?<![\w])\d+(?:\.\d+)?(?:%|\+)?", sentence))
+
+    # Group by source so a high aggregate score cannot be assembled out of
+    # unrelated documents that happen to share common terminology.
+    groups = {}
+    for doc, meta in candidates:
+        doc_numbers = set(re.findall(r"(?<![\w])\d+(?:\.\d+)?(?:%|\+)?", doc))
+        dt = evidence_terms(doc)
+        shared = terms & dt
+        if len(shared) >= 3:
+            groups.setdefault(meta.get("source"), []).append((doc, meta, shared, doc_numbers))
+
+    successful = []
+    for source, group in groups.items():
+        selected, covered, covered_numbers = [], set(), set()
+        pool = group[:]
+        while pool and len(selected) < max_sources:
+            # Choose the passage adding the greatest amount of answer content;
+            # break equal scores in favor of earlier original chunk indices.
+            pool.sort(key=lambda item: (
+                -len(item[2] - covered),
+                item[1].get("chunk_number") if isinstance(item[1].get("chunk_number"), int) else 10**9,
+            ))
+            best = pool.pop(0)
+            new_terms = best[2] - covered
+            if len(new_terms) < (3 if not selected else 2):
+                break
+            selected.append(best)
+            covered.update(best[2])
+            covered_numbers.update(best[3])
+            if len(selected) >= 2 and len(covered) / len(terms) >= 0.83 and numeric.issubset(covered_numbers):
+                break
+        if (2 <= len(selected) <= max_sources
+                and len(covered) / len(terms) >= 0.83
+                and numeric.issubset(covered_numbers)):
+            successful.append((len(covered) / len(terms), len(selected), source, selected))
+
+    if not successful:
+        return []
+    successful.sort(key=lambda item: (-item[0], item[1]))
+    chosen = successful[0][3]
+    chosen.sort(key=lambda item: (item[1].get("page") or 0,
+        item[1].get("chunk_number") if isinstance(item[1].get("chunk_number"), int) else 10**9))
+    return [(doc, meta) for doc, meta, _, _ in chosen]
+
+
 def annotate_answer_with_evidence(answer, records, used_metadata):
     """Annotate supported sentences using text included in the query context.
 
@@ -539,24 +595,51 @@ def annotate_answer_with_evidence(answer, records, used_metadata):
             score = evidence_match_score(original, doc)
             if score is not None:
                 scored.append((score, doc, meta))
-        if not scored:
+        if scored:
+            # When an individual passage covers enough of the answer, prefer
+            # that more precise citation to a multi-passage attribution.
+            scored.sort(key=lambda item: (-item[0],
+                item[2].get("chunk_number") if isinstance(item[2].get("chunk_number"), int) else 10**9))
+            selected = [(scored[0][1], scored[0][2])]
+        else:
+            selected = multi_evidence_matches(original, citation_candidates)
+        if not selected:
             result.append(original)
             continue
-        # When lexical support is equivalent, cite the earlier original chunk.
-        # The explicit overlap removal above prevents a later chunk from
-        # claiming a repeated leading sentence just because it was retrieved first.
-        scored.sort(key=lambda item: (-item[0],
-                                      item[2].get("chunk_number") if isinstance(item[2].get("chunk_number"), int) else 10**9))
-        _, _, metadata = scored[0]
-        source_key = (metadata.get("source"), metadata.get("file_type"),
-                      metadata.get("page"), metadata.get("table_number"),
-                      metadata.get("table_label"), metadata.get("figure_number"),
-                      metadata.get("chunk_number"), metadata.get("row_number"))
-        if source_key not in ids:
-            ids[source_key] = len(ids) + 1
-            citations.append(f"[{ids[source_key]}] {format_source(metadata)}")
-        result.append(original + f" [{ids[source_key]}]")
+        numbers = []
+        for _, metadata in selected:
+            source_key = (metadata.get("source"), metadata.get("file_type"),
+                          metadata.get("page"), metadata.get("table_number"),
+                          metadata.get("table_label"), metadata.get("figure_number"),
+                          metadata.get("chunk_number"), metadata.get("row_number"))
+            if source_key not in ids:
+                ids[source_key] = len(ids) + 1
+                citations.append(f"[{ids[source_key]}] {format_source(metadata)}")
+            numbers.append(ids[source_key])
+        result.append(original + " " + " ".join(f"[{n}]" for n in dict.fromkeys(numbers)))
     return " ".join(result), citations
+
+
+def is_multi_part_question(question):
+    """Recognize explicitly joined questions without broadening retrieval."""
+    return bool(
+        len(re.findall(r"\b(?:what|how|why|which|who|when|where)\b", question, re.I)) >= 2
+        or len(re.findall(r"[?]", question)) >= 2
+        or re.search(r"\b(?:and|also)\s+(?:describe|explain|list|compare|summari[sz]e)\b", question, re.I)
+    )
+
+
+def answer_ends_cleanly(answer):
+    """Reject visibly unfinished prose; tables and ordered lists may end differently."""
+    answer = answer.strip()
+    if not answer or answer == "INSUFFICIENT_INFORMATION":
+        return bool(answer)
+    if answer[-1] in ".!?":
+        return True
+    # Preserve structured exact values and complete numbered/bulleted lists.
+    if "\n" in answer and re.search(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", answer):
+        return True
+    return False
 
 
 def generate_grounded_answer(question, context):
@@ -564,7 +647,8 @@ def generate_grounded_answer(question, context):
         "Answer using ONLY the retrieved context. If the evidence is insufficient, "
         "reply exactly INSUFFICIENT_INFORMATION. Never guess. "
         "For questions about how something works, give its essential steps and "
-        "outcome in 2-4 sentences, when supported. Be accurate, complete, "
+        "outcome in 2-4 sentences, when supported. Answer EVERY part of a "
+        "multi-part question; finish each sentence. Be accurate, complete, "
         "and concise; avoid filler and unsupported details. "
         "For tables, preserve exact model, system, dataset and metric associations; "
         "missing values are not zero. "
@@ -572,29 +656,48 @@ def generate_grounded_answer(question, context):
         "numerical values.\n\n"
         "Context:\n" + context + "\n\nQuestion:\n" + question
     )
-    # Leave more room for explicit table/figure comparisons; ordinary
-    # semantic questions usually need much shorter answers.
-    max_output_tokens = 192 if (table_references(question) or figure_references(question)
-                                or wants_broader_context(question)) else 120
-    generation_started = time.perf_counter()
-    response = ollama.chat(
-        model=ANSWER_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        think=False,
-        options={"num_predict": max_output_tokens},
-    )
-    if PROFILE_ENABLED:
-        def ns_to_s(v):
-            return f"{(v or 0)/1_000_000_000:.3f}s"
-        profile_log(
-            "ollama_chat=" + seconds(generation_started)
-            + " load=" + ns_to_s(getattr(response, "load_duration", 0))
-            + " prompt_eval=" + ns_to_s(getattr(response, "prompt_eval_duration", 0))
-            + " token_eval=" + ns_to_s(getattr(response, "eval_duration", 0))
-            + f" prompt_tokens={getattr(response, 'prompt_eval_count', None)}"
-            + f" generated_tokens={getattr(response, 'eval_count', None)}"
+    is_complex = (table_references(question) or figure_references(question)
+                  or wants_broader_context(question) or is_multi_part_question(question))
+    max_output_tokens = 256 if is_complex else 120
+
+    for attempt in range(2):
+        generation_started = time.perf_counter()
+        response = ollama.chat(
+            model=ANSWER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            think=False,
+            options={"num_predict": max_output_tokens},
         )
-    return response["message"]["content"].strip()
+        answer = response["message"]["content"].strip()
+        reason = getattr(response, "done_reason", None)
+        token_count = getattr(response, "eval_count", None)
+        limit_reached = (reason == "length" or
+                         (isinstance(token_count, int) and token_count >= max_output_tokens))
+        complete = answer_ends_cleanly(answer)
+        if PROFILE_ENABLED:
+            def ns_to_s(v):
+                return f"{(v or 0)/1_000_000_000:.3f}s"
+            profile_log(
+                "ollama_chat=" + seconds(generation_started)
+                + " load=" + ns_to_s(getattr(response, "load_duration", 0))
+                + " prompt_eval=" + ns_to_s(getattr(response, "prompt_eval_duration", 0))
+                + " token_eval=" + ns_to_s(getattr(response, "eval_duration", 0))
+                + f" prompt_tokens={getattr(response, 'prompt_eval_count', None)}"
+                + f" generated_tokens={token_count}"
+                + f" limit={max_output_tokens} done_reason={reason}"
+                + f" complete={complete} attempt={attempt + 1}"
+            )
+        if answer == "INSUFFICIENT_INFORMATION":
+            return answer
+        if complete and not limit_reached:
+            return answer
+        if attempt == 0:
+            # Retry the whole question once so a continuation cannot introduce
+            # unsupported content disconnected from the retrieved context.
+            max_output_tokens = max(384, max_output_tokens * 2)
+            profile_log(f"answer_retry=incomplete_or_length new_limit={max_output_tokens}")
+    profile_log("answer_rejected=still_incomplete_after_retry")
+    return "INSUFFICIENT_INFORMATION"
 
 
 # --------------------------------------------------
