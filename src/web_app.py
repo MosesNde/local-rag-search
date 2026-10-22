@@ -1,9 +1,10 @@
-"""Streamlit UI for the local RAG search engine, including PDF citation viewing."""
+"""Streamlit interface for Local RAG Search with message-scoped citations."""
 import re
+from difflib import SequenceMatcher
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import chromadb
 import streamlit as st
@@ -17,7 +18,6 @@ INDEX_SCRIPT = ROOT / 'src' / 'index_documents.py'
 QUERY_SCRIPT = ROOT / 'src' / 'query_documents.py'
 DOCUMENT_TYPES = {'.txt', '.pdf'}
 IMAGE_TYPES = {'.png', '.jpg', '.jpeg', '.webp'}
-
 for directory in (DOCUMENTS_DIR, IMAGES_DIR, DB_PATH):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -80,25 +80,21 @@ def parse_query_output(output):
         return output.strip(), []
     content = output.split('Answer:', 1)[1]
     if 'Retrieved sources:' in content:
-        answer, sources_section = content.split('Retrieved sources:', 1)
+        answer, source_text = content.split('Retrieved sources:', 1)
     else:
-        answer, sources_section = content, ''
-    sources = [line.strip()[2:] for line in sources_section.splitlines()
+        answer, source_text = content, ''
+    sources = [line.strip()[2:] for line in source_text.splitlines()
                if line.strip().startswith('- ')]
     return answer.strip(), sources
 
 
-# Citation labels produced by query_documents.py, e.g.:
-# [1] agentchaos.pdf (Figure 3, page 5)
-# [1] paper.pdf (Table II, page 6, row 1)
-PDF_LOCATOR = re.compile(r'(?P<name>[^/\\\n]+?\.pdf)\s*\((?P<detail>[^)]*)\)', re.I)
 PREFIX = re.compile(r'^\[(\d+)\]\s*')
+PDF_LOCATOR = re.compile(r'(?P<name>[^/\\\n]+?\.pdf)\s*\((?P<detail>[^)]*)\)', re.I)
 
 
 def parse_pdf_source(source):
-    # Strip citation number or unverified-context prefix before PDF parsing.
-    source = re.sub(r'^\s*\[\d+\]\s*', '', source)
-    source = re.sub(r'^\s*Retrieved context \(citation unverified\):\s*', '', source, flags=re.I)
+    source = PREFIX.sub('', source).strip()
+    source = re.sub(r'^Retrieved context \(citation unverified\):\s*', '', source, flags=re.I)
     match = PDF_LOCATOR.search(source)
     if not match:
         return None
@@ -110,38 +106,7 @@ def parse_pdf_source(source):
     return (name, page) if page >= 1 else None
 
 
-def local_pdf(name):
-    """Never allow a citation to reference paths outside data/documents."""
-    if not name or Path(name).name != name or '/' in name or '\\' in name:
-        return None
-    path = (DOCUMENTS_DIR / name).resolve()
-    if path.parent != DOCUMENTS_DIR.resolve() or path.suffix.lower() != '.pdf':
-        return None
-    return path if path.is_file() else None
-
-
-def evidence_url(name, page):
-    return '?' + urlencode({'evidence_source': name, 'evidence_page': str(page)})
-
-
-def citation_buttons(sources, message_id):
-    """All numbered citations can be selected, regardless of source format."""
-    numbered = [(PREFIX.match(source).group(1), source)
-                for source in sources if PREFIX.match(source)]
-    if not numbered:
-        return
-    st.caption("View cited evidence:")
-    cols = st.columns(min(6, len(numbered)))
-    for idx, (number, source) in enumerate(numbered):
-        with cols[idx % len(cols)]:
-            if st.button(f"[{number}]", key=f"cite_{message_id}_{idx}",
-                         help=f"Inspect source {number}"):
-                st.session_state.selected_evidence = source
-                st.rerun()
-
-
 def local_source_file(name):
-    """Restrict local previews to whitelisted project input directories."""
     if not name or Path(name).name != name or '/' in name or '\\' in name:
         return None
     for base in (DOCUMENTS_DIR, IMAGES_DIR):
@@ -151,9 +116,14 @@ def local_source_file(name):
     return None
 
 
+def local_pdf(name):
+    path = local_source_file(name)
+    return path if path and path.suffix.lower() == '.pdf' and path.parent == DOCUMENTS_DIR.resolve() else None
+
+
 def get_source_name(source):
-    """Extract a source label while preserving spaces and punctuation in names."""
     label = PREFIX.sub('', source).strip()
+    label = re.sub(r'^Retrieved context \(citation unverified\):\s*', '', label, flags=re.I)
     for suffix in ('.pdf', '.txt', '.png', '.jpg', '.jpeg', '.webp'):
         match = re.search(re.escape(suffix) + r'(?=\s*\(|$)', label, re.I)
         if match:
@@ -162,13 +132,12 @@ def get_source_name(source):
 
 
 def parse_table_row_locator(source):
-    """Return (table label, row number) only for explicit row citations."""
     match = PDF_LOCATOR.search(PREFIX.sub('', source).strip())
     if not match:
         return None
-    detail = match.group('detail')
-    table = re.search(r'\bTable\s+([IVXLCDM]+|\d+)\b', detail, re.I)
-    row = re.search(r'\brow\s+(\d+)\b', detail, re.I)
+    details = match.group('detail')
+    table = re.search(r'\bTable\s+([IVXLCDM]+|\d+)\b', details, re.I)
+    row = re.search(r'\brow\s+(\d+)\b', details, re.I)
     if not table or not row:
         return None
     return 'Table ' + table.group(1), int(row.group(1))
@@ -176,7 +145,6 @@ def parse_table_row_locator(source):
 
 @st.cache_data(show_spinner=False, max_entries=32)
 def table_row_category(pdf_name, table_label, page_number, row_number):
-    """Look up the actual indexed row text; read-only against existing ChromaDB."""
     db = chromadb.PersistentClient(path=str(DB_PATH))
     collection = db.get_collection('documents')
     records = collection.get(where={'$and': [
@@ -188,76 +156,136 @@ def table_row_category(pdf_name, table_label, page_number, row_number):
             f"Table {meta['table_number']}" if meta.get('table_number') is not None else None)
         if not actual_label or actual_label.casefold() != table_label.casefold():
             continue
-        # Row text may include Source/Page/Caption lines before Row N.
-        record = re.search(r'\bRow\s+\d+\s*:\s*OWASP Category\s*:\s*([^|\n]+)',
-                           document, re.I)
-        if record:
-            return record.group(1).strip()
+        match = re.search(r'\bRow\s+\d+\s*:\s*OWASP Category\s*:\s*([^|\n]+)',
+                          document, re.I)
+        if match:
+            return match.group(1).strip()
     return None
 
 
+def parse_pdf_chunk_locator(source):
+    """Parse page-local PDF text chunk citation, excluding tables/figures."""
+    if parse_table_row_locator(source) is not None:
+        return None
+    matched = PDF_LOCATOR.search(PREFIX.sub('', source).strip())
+    if not matched:
+        return None
+    detail = matched.group('detail')
+    if re.search(r'\b(?:Table|Figure)\b', detail, re.I):
+        return None
+    chunk = re.search(r'\bchunk\s+(\d+)\b', detail, re.I)
+    return int(chunk.group(1)) if chunk else None
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def indexed_pdf_chunk(name, page, chunk_number):
+    """Read the actual cited chunk; do not silently substitute another chunk."""
+    db = chromadb.PersistentClient(path=str(DB_PATH))
+    collection = db.get_collection('documents')
+    found = collection.get(where={'$and': [
+        {'source': name}, {'file_type': 'pdf'},
+        {'page': page}, {'chunk_number': chunk_number},
+    ]}, include=['documents', 'metadatas'])
+    documents = found.get('documents') or []
+    return documents[0] if len(documents) == 1 else None
+
+
+def _word_token(word):
+    return re.sub(r'[^a-z0-9]', '', word.casefold())
+
+
+def highlight_pdf_chunk(page, chunk_text):
+    """Highlight a substantial exact word sequence on the specified PDF page.
+
+    Chunk text can contain line-break differences; only a sufficiently long,
+    unique contiguous matching word sequence is highlighted. Never approximate
+    coordinates based on the chunk number.
+    """
+    words = page.get_text('words', sort=True)
+    page_words = [(item, _word_token(item[4])) for item in words]
+    page_words = [(item, tok) for item, tok in page_words if tok]
+    chunk_tokens = [_word_token(w) for w in re.findall(r'\S+', chunk_text)]
+    chunk_tokens = [tok for tok in chunk_tokens if tok]
+    if len(page_words) < 8 or len(chunk_tokens) < 8:
+        return False, 0
+    a = [tok for _, tok in page_words]
+    matcher = SequenceMatcher(None, a, chunk_tokens, autojunk=False)
+    matches = [m for m in matcher.get_matching_blocks() if m.size >= 10]
+    if not matches:
+        return False, 0
+    best = max(matches, key=lambda m: m.size)
+    # A short common phrase can occur repeatedly. Reject ambiguous matches.
+    sequence = a[best.a:best.a + min(best.size, 12)]
+    occurrences = sum(a[i:i + len(sequence)] == sequence
+                      for i in range(len(a) - len(sequence) + 1))
+    if occurrences != 1:
+        return False, 0
+    count = min(best.size, 65)
+    rects = [page_words[i][0][:4] for i in range(best.a, best.a + count)]
+    annot = page.add_highlight_annot(rects)
+    annot.set_colors(stroke=(1, .75, 0))
+    annot.update()
+    return True, count
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
-def pdf_page_png(name, page, modified_ns, table_label=None, row_number=None):
-    """Render one PDF page, highlighting a VERIFIED located table row if possible."""
+def pdf_page_png(name, page, modified_ns, table_label=None, row_number=None, chunk_text=None):
+    """Render the cited page; retain verified PDF table-row highlighting."""
     import fitz
     path = local_pdf(name)
     if path is None:
         raise FileNotFoundError(name)
-    category = None
-    if table_label and row_number:
-        category = table_row_category(name, table_label, page, row_number)
-    with fitz.open(path) as doc:
-        if page > len(doc):
-            raise ValueError(f'Page {page} is outside this {len(doc)}-page PDF.')
-        pdf_page = doc.load_page(page - 1)
+    category = (table_row_category(name, table_label, page, row_number)
+                if table_label and row_number else None)
+    with fitz.open(path) as document:
+        if page > len(document):
+            raise ValueError(f'Page {page} is outside this {len(document)}-page PDF.')
+        pdf_page = document.load_page(page - 1)
         highlighted = False
         highlight_type = None
         if category:
-            # Prefer a matching detected table row: never guess based on row height.
             try:
                 tables = pdf_page.find_tables()
                 for table in tables.tables:
-                    extracted = table.extract()
-                    for i, row in enumerate(extracted):
-                        if not any(cell and category.casefold() in cell.casefold()
-                                   for cell in row):
+                    for idx, row in enumerate(table.extract()):
+                        if not any(cell and category.casefold() in cell.casefold() for cell in row):
                             continue
-                        if i < len(table.rows):
-                            rect = fitz.Rect(table.rows[i].bbox)
+                        if idx < len(table.rows):
                             shape = pdf_page.new_shape()
-                            shape.draw_rect(rect)
+                            shape.draw_rect(fitz.Rect(table.rows[idx].bbox))
                             shape.finish(color=(1, 0.48, 0), fill=(1, 0.85, 0.12),
                                          fill_opacity=0.17, width=1.5)
                             shape.commit(overlay=True)
-                            highlighted = True
-                            highlight_type = 'row'
+                            highlighted, highlight_type = True, 'row'
                             break
                     if highlighted:
                         break
             except Exception:
                 pass
             if not highlighted:
-                # A category label is safer than guessing an entire row boundary.
                 found = pdf_page.search_for(category)
-                if found:
-                    # Category labels reside in the left part of this table.
-                    rects = [r for r in found if r.x0 < pdf_page.rect.width * 0.55]
-                    if len(rects) == 1:
-                        annot = pdf_page.add_highlight_annot(rects[0])
-                        annot.set_colors(stroke=(1, 0.75, 0))
-                        annot.update()
-                        highlighted = True
-                        highlight_type = 'category cell'
-        pixmap = pdf_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, annots=True)
-        return pixmap.tobytes('png'), len(doc), highlighted, highlight_type, category
+                left = [r for r in found if r.x0 < pdf_page.rect.width * .55]
+                if len(left) == 1:
+                    annot = pdf_page.add_highlight_annot(left[0])
+                    annot.set_colors(stroke=(1, .75, 0))
+                    annot.update()
+                    highlighted, highlight_type = True, 'category cell'
+        if chunk_text and not highlighted and not table_label:
+            highlighted, word_count = highlight_pdf_chunk(pdf_page, chunk_text)
+            if highlighted:
+                highlight_type = f'PDF text passage ({word_count} matching words)'
+        png = pdf_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False,
+                                 annots=True).tobytes('png')
+        return png, len(document), highlighted, highlight_type, category
 
 
-def show_evidence():
-    """Display evidence matching the selected citation, not just PDFs."""
-    source = st.session_state.get('selected_evidence')
-    if not source:
+def show_evidence(selection):
+    """Always show the source selected from its original assistant message."""
+    if not selection:
         return
-    st.subheader("Source evidence")
+    source = selection['source']
+    st.subheader('Source evidence')
+    st.caption(f"Answer {selection['answer_number']} · Citation [{selection['citation_number']}]")
     st.caption(source)
     pdf = parse_pdf_source(source)
     if pdf:
@@ -267,58 +295,84 @@ def show_evidence():
             st.info("The original PDF isn't available under data/documents.")
             return
         try:
-            row_locator = parse_table_row_locator(source)
-            label, number = row_locator if row_locator else (None, None)
-            png, count, highlighted, highlight_type, category = pdf_page_png(
-                name, page, path.stat().st_mtime_ns, label, number)
-            st.caption(f"Page {page} of {count}")
-            if row_locator:
+            locator = parse_table_row_locator(source)
+            label, number = locator if locator else (None, None)
+            chunk_number = parse_pdf_chunk_locator(source)
+            chunk_text = (indexed_pdf_chunk(name, page, chunk_number)
+                          if chunk_number is not None else None)
+            png, count, highlighted, kind, category = pdf_page_png(
+                name, page, path.stat().st_mtime_ns, label, number, chunk_text)
+            st.caption(f'Page {page} of {count}')
+            if locator:
                 if highlighted:
-                    st.success(f"Highlighted {highlight_type}: {category} (row {number})")
+                    st.success(f'Highlighted {kind}: {category} (row {number})')
                 else:
-                    st.info(f"Table {label}, row {number} is cited, but its position "
-                            "could not be reliably located on this page. No highlight was added.")
+                    st.info('Exact row position could not be reliably located; showing the page.')
+            if chunk_number is not None:
+                if highlighted:
+                    st.success(f'Highlighted supporting {kind}.')
+                elif chunk_text is None:
+                    st.info('Indexed text for this cited PDF chunk was not found. Showing the page without highlighting.')
+                else:
+                    st.info('The indexed passage could not be matched reliably to the PDF page. No highlight was added.')
             st.image(png, use_container_width=True)
-            st.download_button("Download PDF", data=path.read_bytes(),
-                               file_name=path.name, mime='application/pdf')
+            st.download_button('Download PDF', data=path.read_bytes(),
+                               file_name=path.name, mime='application/pdf',
+                               key=f"dl_{selection['message_id']}_{selection['citation_number']}")
         except ImportError:
-            st.warning("Install PyMuPDF to view PDF pages: pip install pymupdf")
+            st.warning('PDF rendering requires PyMuPDF: pip install pymupdf')
         except Exception as exc:
-            st.warning(f"Unable to display this PDF page: {exc}")
+            st.warning(f'Unable to display this PDF page: {exc}')
         return
-
     name = get_source_name(source)
     path = local_source_file(name)
     if path and path.suffix.lower() == '.txt':
-        st.caption(f"Text document: {path.name}")
-        st.text_area("Document content (preview)",
+        st.caption(f'Text document: {path.name}')
+        st.text_area('Document content (preview)',
                      path.read_text(encoding='utf-8', errors='replace')[:12000],
-                     height=380, disabled=True)
+                     height=380, disabled=True,
+                     key=f"txt_{selection['message_id']}_{selection['citation_number']}")
     elif path and path.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
-        st.caption(f"Image: {path.name}")
+        st.caption(f'Image: {path.name}')
         st.image(str(path), use_container_width=True)
     elif name.startswith(('https://', 'http://')):
         parsed = urlparse(name)
         if parsed.scheme in ('http', 'https') and parsed.hostname:
-            st.link_button("Open original webpage", name)
-        else:
-            st.info("Original webpage address unavailable.")
+            st.link_button('Open original webpage', name)
     else:
-        st.info("This citation is available as a source reference. A local preview "
-                "is not available for this source type or file location.")
+        st.info('Source reference available; local preview unavailable for this source.')
+
+
+def citation_buttons(sources, message_id, answer_number):
+    numbered = [(PREFIX.match(source).group(1), source)
+                for source in sources if PREFIX.match(source)]
+    if not numbered:
+        return
+    st.caption('View cited evidence:')
+    cols = st.columns(min(6, len(numbered)))
+    for idx, (number, source) in enumerate(numbered):
+        with cols[idx % len(cols)]:
+            if st.button(f'[{number}]', key=f'cite_{message_id}_{idx}',
+                         help=f'Answer {answer_number}, citation {number}'):
+                st.session_state.selected_evidence = {
+                    'source': source,
+                    'message_id': message_id,
+                    'answer_number': answer_number,
+                    'citation_number': number,
+                }
+                st.rerun()
 
 
 def display_sources(sources):
-    if not sources:
-        return
-    with st.expander(f"Retrieved sources ({len(sources)})"):
-        for source in sources:
-            st.text(f"• {source}")
+    if sources:
+        with st.expander(f'Retrieved sources ({len(sources)})'):
+            for source in sources:
+                st.text(f'• {source}')
 
 
-def render_assistant(answer, sources, message_id):
+def render_assistant(answer, sources, message_id, answer_number):
     st.markdown(answer)
-    citation_buttons(sources, message_id)
+    citation_buttons(sources, message_id, answer_number)
     display_sources(sources)
 
 
@@ -332,8 +386,8 @@ with st.sidebar:
     st.title('Knowledge Base')
     try:
         st.metric('Indexed records', get_record_count())
-    except Exception as error:
-        st.error(f'Database error: {error}')
+    except Exception as exc:
+        st.error(f'Database error: {exc}')
     st.divider()
     uploaded_files = st.file_uploader('Upload documents or images',
         type=['txt', 'pdf', 'png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
@@ -355,12 +409,12 @@ if index_clicked:
             saved, skipped = save_uploaded_files(uploaded_files) if uploaded_files else ([], [])
             if saved:
                 st.success(f'Saved {len(saved)} new file(s).')
-                for filename in saved:
-                    st.write(f'• {filename}')
+                for name in saved:
+                    st.write(f'• {name}')
             if skipped:
                 st.info('Files already present or unsupported:')
-                for filename in skipped:
-                    st.write(f'• {filename}')
+                for name in skipped:
+                    st.write(f'• {name}')
             if added is True:
                 st.success('Webpage URL added.')
             elif added is False:
@@ -378,29 +432,35 @@ if index_clicked:
                     st.code(result.stdout + '\n' + result.stderr, language='text')
         except subprocess.TimeoutExpired:
             st.error('Indexing exceeded the time limit.')
-        except Exception as error:
-            st.error(f'Indexing error: {error}')
+        except Exception as exc:
+            st.error(f'Indexing error: {exc}')
 
 st.title('🔎 Local RAG Search')
 st.caption('Chat with your documents using locally running AI.')
 
-# Keep chat full-width until a citation is explicitly selected.
-# This also means the evidence pane stays hidden when the app first opens,
-# after a new answer, and after the chat is cleared.
-selected_evidence = st.session_state.get('selected_evidence')
-if selected_evidence:
+# Important: consume a newly submitted question BEFORE creating the layout.
+# This removes the Close evidence widget from the run that performs a blocking query.
+question = st.chat_input('Ask a question about your documents...')
+if question:
+    st.session_state.selected_evidence = None
+    st.session_state.messages.append({'role': 'user', 'content': question})
+
+selected = st.session_state.selected_evidence
+if selected:
     chat_col, evidence_col = st.columns([1.15, 1], gap='large')
 else:
-    chat_col = st.container()
-    evidence_col = None
+    chat_col, evidence_col = st.container(), None
 
 with chat_col:
     if not st.session_state.messages:
         st.info('Ask a question about your indexed documents to begin a conversation.')
-    for message_index, message in enumerate(st.session_state.messages):
+    answer_number = 0
+    for message_id, message in enumerate(st.session_state.messages):
         with st.chat_message(message['role']):
             if message['role'] == 'assistant':
-                render_assistant(message['content'], message.get('sources', []), message_index)
+                answer_number += 1
+                render_assistant(message['content'], message.get('sources', []),
+                                 message_id, answer_number)
             else:
                 st.markdown(message['content'])
 
@@ -409,40 +469,36 @@ if evidence_col is not None:
         if st.button('Close evidence', key='close_evidence'):
             st.session_state.selected_evidence = None
             st.rerun()
-        show_evidence()
+        show_evidence(selected)
 
-question = st.chat_input('Ask a question about your documents...')
 if question:
-    st.session_state.selected_evidence = None
-    st.session_state.messages.append({'role': 'user', 'content': question})
     with chat_col:
-      with st.chat_message('user'):
-        st.markdown(question)
-    with chat_col:
-     with st.chat_message('assistant'):
-          try:
-              if get_record_count() == 0:
-                  answer = 'Your knowledge base is empty. Please index some documents first.'
-                  sources = []
-              else:
-                  with st.spinner('Searching your knowledge base...'):
-                      result = run_query(question)
-                  if result.returncode != 0:
-                      answer = 'The search could not be completed. Check that Ollama is running.'
-                      sources = []
-                      with st.expander('Error details'):
-                          st.code(result.stdout + '\n' + result.stderr, language='text')
-                  else:
-                      answer, sources = parse_query_output(result.stdout)
-                      if not answer:
-                          answer = 'The query completed without a readable answer.'
-              render_assistant(answer, sources, len(st.session_state.messages))
-              st.session_state.messages.append({'role': 'assistant', 'content': answer, 'sources': sources})
-          except subprocess.TimeoutExpired:
-              answer = 'Question answering took too long. Check that Ollama is running.'
-              st.error(answer)
-              st.session_state.messages.append({'role': 'assistant', 'content': answer, 'sources': []})
-          except Exception as error:
-              answer = f'Search error: {error}'
-              st.error(answer)
-              st.session_state.messages.append({'role': 'assistant', 'content': answer, 'sources': []})
+        with st.chat_message('assistant'):
+            try:
+                if get_record_count() == 0:
+                    answer, sources = ('Your knowledge base is empty. '
+                                       'Please index some documents first.'), []
+                else:
+                    with st.spinner('Searching your knowledge base...'):
+                        result = run_query(question)
+                    if result.returncode:
+                        answer, sources = ('The search could not be completed. '
+                                           'Check that Ollama is running.'), []
+                        with st.expander('Error details'):
+                            st.code(result.stdout + '\n' + result.stderr, language='text')
+                    else:
+                        answer, sources = parse_query_output(result.stdout)
+                        if not answer:
+                            answer = 'The query completed without a readable answer.'
+                st.session_state.messages.append({
+                    'role': 'assistant', 'content': answer, 'sources': sources})
+                render_assistant(answer, sources, len(st.session_state.messages) - 1,
+                                 answer_number + 1)
+            except subprocess.TimeoutExpired:
+                answer = 'Question answering took too long. Check that Ollama is running.'
+                st.error(answer)
+                st.session_state.messages.append({'role': 'assistant', 'content': answer, 'sources': []})
+            except Exception as exc:
+                answer = f'Search error: {exc}'
+                st.error(answer)
+                st.session_state.messages.append({'role': 'assistant', 'content': answer, 'sources': []})
