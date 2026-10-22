@@ -1,469 +1,245 @@
 # Local RAG Search Engine
 
+A locally running **retrieval-augmented generation (RAG)** search application built with Python, [Ollama](https://ollama.com/), [ChromaDB](https://www.trychroma.com/), and [Streamlit](https://streamlit.io/).
 
+Index local TXT/PDF documents, images, and webpages, then ask questions using a local language model. The system supports source-aware table lookup, PDF figure descriptions, and neighboring-chunk context.
 
-A locally running Retrieval-Augmented Generation (RAG) search engine built with Python, Ollama, and ChromaDB.
-
-
-
-The application allows users to index local documents, webpages, and images, then ask questions using a local language model. Retrieved content provides context for grounded answers, with source references and insufficient-information handling.
-
-
+> **Status:** Functional research/development prototype. Not production-hardened; retrieved sources do not guarantee that every generated claim is correct.
 
 ## Features
 
+- **Inputs:** TXT, PDF, PNG, JPG/JPEG, WebP, and webpages.
+- **Local models:** `nomic-embed-text` embeddings, `qwen3:8b` answers, and `qwen3-vl:8b` image descriptions (configurable).
+- **Persistent knowledge base:** ChromaDB collection `documents` in `data/chroma/`.
+- **PDF support:** Text extraction, figure cropping/description/validation, and structured table extraction and validation.
+- **Source-aware table references:** Supports both newer numeric references (such as Table 3) and legacy Roman numerals (such as Table II).
+- **Exact table operations:** Certain structured table listings and numerical rankings are handled directly in Python rather than reconstructed by a language model.
+- **Neighboring-chunk retrieval:** Adds nearby text passages when a relevant explanation spans several chunks.
+- **Interfaces:** Streamlit web app and command-line questions.
+- **Diagnostics:** Regression testing, retrieval evaluation, and optional profiling.
 
-
-\- \*\*Multiple input formats:\*\* TXT, PDF, JPG, JPEG, PNG, WebP, and webpages.
-
-\- \*\*Local embeddings:\*\* Uses `nomic-embed-text`.
-
-\- \*\*Persistent vector database:\*\* Stores embeddings, text chunks, and metadata in ChromaDB.
-
-\- \*\*Local answer generation:\*\* Uses `qwen3:8b`.
-
-\- \*\*Image understanding:\*\* Uses `qwen2.5vl:3b` to generate searchable image descriptions.
-
-\- \*\*Source tracking:\*\* Displays filenames, PDF page numbers, and retrieved chunk numbers.
-
-\- \*\*Answer rejection:\*\* Uses a distance threshold and grounded-generation instructions to handle insufficient information.
-
-\- \*\*Incremental additions:\*\* Skips sources already present in the database.
-
-
+Sources can include filenames, pages, table/figure numbers, and chunk references. They are not yet verified claim-level citations.
 
 ## Architecture
 
-
-
 ### Indexing
 
-
-
 ```text
-
-TXT documents ────────────────┐
-
-PDF documents → Text extraction│
-
-Webpage URLs → HTML extraction ├→ Text chunks
-
-Images → Vision model ────────┘       ↓
-
-&#x20;                              nomic-embed-text
-
-&#x20;                                     ↓
-
-&#x20;                                  ChromaDB
-
+TXT/PDF text and webpages ---> Text extraction and chunking ----┐
+Images ---------------------> Vision-generated descriptions ----┤
+PDF figures ----------------> Crop, describe, validate ----------┤
+PDF tables -----------------> Extract, structure, validate ------┤
+                                                                 v
+                                                        nomic-embed-text
+                                                                 |
+                                                                 v
+                                                        ChromaDB documents
 ```
-
-
-
-Image descriptions are initially stored as one record per image.
-
-
 
 ### Question answering
 
-
-
 ```text
-
-User question
-
-&#x20;    ↓
-
-nomic-embed-text
-
-&#x20;    ↓
-
-ChromaDB retrieves 10 chunks
-
-&#x20;    ↓
-
-Distance threshold
-
-&#x20;    ↓
-
-Qwen3 generates an answer
-
-or rejects insufficient context
-
-&#x20;    ↓
-
-Answer + retrieved sources
-
+Question
+   |
+   +-- Explicit table/figure reference? --> Source-aware lookup
+   |                                        (some exact table answers in Python)
+   |
+   +-- Otherwise --> Embedding --> Semantic search
+                                      |
+                                      v
+                              Neighboring text chunks
+   |
+   v
+Retrieved evidence --> qwen3:8b --> Answer and retrieved sources
 ```
-
-
 
 ## Requirements
 
+- Python and `pip` (development used Python 3.14; other versions have not been comprehensively tested).
+- [Ollama](https://ollama.com/) installed and running.
+- Sufficient system memory for the selected models.
+- Internet connectivity for initial downloads and webpage indexing.
 
-
-\- Python 3.14 (development environment)
-
-\- Ollama installed and running
-
-\- Enough available memory to run the local models
-
-\- Internet access for downloading models and indexing webpages
-
-
-
-Install Ollama from https://ollama.com.
-
-
-
-Download the required models:
-
-
+Pull the configured models:
 
 ```powershell
-
 ollama pull nomic-embed-text
-
 ollama pull qwen3:8b
-
-ollama pull qwen2.5vl:3b
-
+ollama pull qwen3-vl:8b
 ```
 
+Image and PDF-figure processing can be substantially more resource-intensive than text retrieval.
 
-
-\## Installation
-
-
+## Installation
 
 Clone the repository:
 
-
-
 ```powershell
-
 git clone https://github.com/MosesNde/local-rag-search.git
-
 cd local-rag-search
-
 ```
 
-
-
-Replace `YOUR\_USERNAME` with the GitHub username where you publish the project.
-
-
-
-Create and activate a virtual environment on Windows:
-
-
+On **Windows PowerShell**:
 
 ```powershell
-
 python -m venv .venv
-
-.\\.venv\\Scripts\\Activate.ps1
-
-```
-
-
-
-Install Python dependencies:
-
-
-
-```powershell
-
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-
 ```
 
-
-
-The indexer creates the required local data directories automatically.
-
-
-
-## Adding content
-
-
-
-### TXT and PDF
-
-
-
-Place files inside:
-
-
-
-```text
-
-data/documents/
-
-```
-
-
-
-### Images
-
-
-
-Place JPG, JPEG, PNG, or WebP images inside:
-
-
-
-```text
-
-data/images/
-
-```
-
-
-
-Images are processed by the local vision model. The resulting descriptions are embedded and indexed for text-based retrieval.
-
-
-
-### Webpages
-
-
-
-Create:
-
-
-
-```text
-
-data/urls.txt
-
-```
-
-
-
-Add one webpage URL per line:
-
-
-
-```text
-
-https://docs.python.org/3/tutorial/introduction.html
-
-```
-
-
-
-Only add URLs whose content you are permitted to retrieve and index.
-
-
-
-## Indexing content
-
-
-
-Run:
-
-
-
-```powershell
-
-python .\\src\\index\_documents.py
-
-```
-
-
-
-The script extracts content, generates embeddings, and stores records in the persistent ChromaDB collection named `documents`.
-
-
-
-Previously indexed sources are skipped. Changes to existing sources are not automatically detected or refreshed.
-
-
-## Web Interface
-
-Local RAG Search includes a Streamlit web interface for managing knowledge sources and asking questions.
-
-### Features
-
-- Upload TXT and PDF documents.
-- Upload PNG, JPG, JPEG, and WebP images.
-- Add webpages by entering their URLs.
-- Index new content into the persistent ChromaDB database.
-- Ask questions using a chat-style interface.
-- View AI-generated answers and expandable source references.
-- Clear chat history without deleting indexed documents.
-
-### Launching the application
-
-**Windows — without a terminal**
-
-After completing the installation steps, double-click:
-
-`START_APP.vbs`
-
-The application launches in your default browser at:
-
-http://localhost:8501
-
-To stop the application, double-click:
-
-`STOP_APP.vbs`
-
-The Windows launchers require the project's `.venv` environment and installed dependencies.
-
-**Windows, macOS, and Linux — using a terminal**
-
-From the project root directory, run:
+On **macOS or Linux**:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Start Ollama before using the application. The default setup assumes Ollama is available locally.
+
+### Model configuration
+
+`src/config.py` reads these environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama endpoint setting |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Text embeddings |
+| `ANSWER_MODEL` | `qwen3:8b` | Answer generation |
+| `VISION_MODEL` | `qwen3-vl:8b` | Image/figure descriptions |
+| `VISION_CONTEXT_SIZE` | `8192` | Vision context configuration |
+| `VISION_MAX_RETRIES` | `1` | Vision retry configuration |
+
+## Add content
+
+| Content | Local path |
+| --- | --- |
+| TXT and PDF files | `data/documents/` |
+| PNG, JPG/JPEG, WebP images | `data/images/` |
+| Webpage URLs (one per line) | `data/urls.txt` |
+
+Example `data/urls.txt`:
+
+```text
+https://docs.python.org/3/tutorial/introduction.html
+```
+
+Run the main indexer from the project root:
+
+```powershell
+python .\src\index_documents.py
+```
+
+The indexer creates local data directories and stores records in the persistent ChromaDB collection `documents`. Sources already indexed are normally skipped; modified and deleted source files are **not** automatically synchronized.
+
+### PDF table and figure pipelines
+
+The codebase includes dedicated modules:
+
+- **Figures:** `src/pdf_figures.py`, `src/pdf_pipeline.py`, and `src/pdf_validation.py` detect/crop, describe, and validate PDF figures.
+- **Tables:** `src/pdf_tables.py`, `src/pdf_table_pipeline.py`, and `src/pdf_table_validation.py` extract and validate structured records.
+- **Legacy/specialized scripts:** `src/index_pdf_figures.py` and `src/index_pdf_tables.py` were developed for earlier indexing workflows; use the integrated pipeline for ordinary indexing.
+
+For an individual PDF figure-processing run:
+
+```powershell
+python .\src\pdf_pipeline.py --pdf example.pdf
+```
+
+For table extraction/validation **without ChromaDB writes**:
+
+```powershell
+python .\src\pdf_table_pipeline.py example.pdf
+```
+
+For explicit table indexing:
+
+```powershell
+python .\src\pdf_table_pipeline.py example.pdf --index
+```
+
+Place `example.pdf` in `data/documents/` or supply a valid path. Extraction and validation are heuristic and do not guarantee perfect correspondence with the rendered PDF.
+
+## Web interface
+
+Start Streamlit:
+
+```powershell
 python -m streamlit run src/web_app.py
 ```
 
-Open http://localhost:8501 if your browser does not open automatically.
+Open **http://localhost:8501** if the browser does not open automatically. The UI supports uploads, URL entry, indexing, questions, expandable retrieved sources, and clearing session chat history.
 
-### Using the interface
+On Windows, double-click `START_APP.vbs` to launch without a visible terminal (requires `.venv`). Use `STOP_APP.vbs` to request shutdown.
 
-1. Upload documents or enter a webpage URL in the sidebar.
-2. Click **Index content** to process new knowledge sources.
-3. Enter a question in the chat box.
-4. Read the AI-generated answer and expand **Retrieved sources** to inspect the supporting material.
-5. Use **Clear chat** to reset the conversation display.
+The web interface is intended for **trusted local use**, not exposure directly to the public internet.
 
-### Notes
-
-- The application runs locally and requires Ollama and the configured models.
-- Image indexing may take longer because a vision model generates descriptions.
-- Chat history is stored temporarily in the Streamlit session.
-- Questions are answered independently; previous chat messages are not yet used as retrieval context.
-- Uploaded documents and ChromaDB records remain stored locally.
-- The interface is intended for trusted local use, not public internet deployment.
-
-
-## Asking questions
-
-
-
-Run:
-
-
+## Command-line questions
 
 ```powershell
-
-python .\\src\\query\_documents.py
-
+python .\src\query_documents.py
 ```
 
-
-
-Example:
-
-
+Example questions (which require the relevant documents to have been indexed):
 
 ```text
-
-Enter your question: How do you write comments in Python?
-
-
-
-Answer:
-
-Comments in Python begin with the # character and extend to the end of the line.
-
-
-
-Retrieved sources:
-
-\- https://docs.python.org/3/tutorial/introduction.html (chunk 4)
-
+What is retrieval-augmented generation?
+According to Table II of the OWASP vulnerability dataset paper, list all OWASP categories and their most affected programming languages.
+What does Figure 3 in agentchaos.pdf show?
 ```
 
+When sufficient evidence exists, the output includes an answer and source references. For some exact structured table requests, Python produces the answer without an LLM call.
 
+## Evaluation and diagnostics
 
-The output identifies retrieved sources. These references do not guarantee that every generated claim is supported by every listed chunk.
+Run the regression tests:
 
+```powershell
+python .\src\test_rag_regression.py --live
+```
 
+At the October 2026 development checkpoint, **3 offline tests and 4 live tests passed** using the development machine's existing indexed corpus. Live tests depend on local indexed documents and models; this is not a general benchmark of RAG accuracy.
 
-\## Evaluation
+Evaluate evidence retrieval:
 
+```powershell
+python .\src\evaluate_retrieval_quality.py
+```
 
+Generated reports are saved under `data/retrieval_tests/`. Some evaluator tests use generic semantic retrieval, so their scores are not equivalent to testing the application's full table-aware route.
 
-During development, a small evaluation set containing 10 questions was used to study retrieval acceptance and rejection.
+Enable optional per-stage profiling:
 
+```powershell
+$env:RAG_PROFILE = "1"
+python .\src\query_documents.py
+```
 
+## Privacy and data handling
 
-| Approach | Acceptance/rejection accuracy |
+Ollama inference and ChromaDB indexing/storage operate locally by default. Downloading packages/models and indexing webpages require external network access. Only retrieve and index content you are authorized to process.
 
-|---|---:|
-
-| Distance threshold alone | 70% |
-
-| Separate Qwen3 answerability check | 100% |
-
-| Single-call Qwen3 grounded generation | 100% |
-
-
-
-These were controlled experiments on a small collection, not a comprehensive benchmark. The single-call evaluation primarily measured whether questions were accepted or rejected, not the full factual correctness of generated answers.
-
-
+Local documents, images, ChromaDB records, extracted figures/tables, and generated reports are excluded from Git using `.gitignore`. **Cloning this repository does not download the development corpus or its database.**
 
 ## Known limitations
 
+- PDF layouts, figures, tables, and vision-generated descriptions may be incomplete or inaccurate.
+- Structural validation does not certify every extracted cell against the original PDF.
+- Chunking is simple; neighboring-chunk expansion reduces but does not eliminate missing-context problems.
+- Grounded answers can still be incomplete or incorrect; source listings are not verified per claim.
+- Ambiguous table references across documents may require a clearer source name.
+- Existing ChromaDB records are not automatically updated when source files change or are removed.
+- Local model inference may be slow on CPU-only machines.
+- Chat messages are displayed within the Streamlit session but are not used as conversational retrieval context.
 
+## Roadmap
 
-\- PDF extraction uses heuristic layout processing and may mishandle complex tables, figures, or multi-column documents.
-
-\- Image descriptions generated by the vision model may miss or misinterpret visual details.
-
-\- Current text chunking is simple and may split abbreviations, URLs, and code.
-
-\- The retrieval distance threshold is experimental.
-
-\- Retrieving 10 chunks may introduce irrelevant context.
-
-\- Modified or deleted sources are not automatically synchronized with ChromaDB.
-
-\- Local inference can be slow on CPU-only hardware.
-
-\- The application currently uses a command-line interface rather than a graphical interface.
-
-
-
-## Privacy and local operation
-
-
-
-Embeddings, indexed content, and answer generation are handled locally through Ollama and ChromaDB. Webpage indexing requires external HTTP requests, and downloading dependencies or models requires network access.
-
-
-
-The project's local documents, images, URL list, virtual environment, and ChromaDB data are excluded from version control through `.gitignore`.
-
-
-
-## Future improvements
-
-
-
-\- Refresh and delete outdated indexed records.
-
-\- Improve chunking and PDF layout extraction.
-
-\- Add reranking and more precise evidence attribution.
-
-\- Expand retrieval and answer-quality evaluations.
-
-\- Build a graphical interface for document management and search.
-
-
+- Claim-level citation/evidence attribution.
+- Safer refresh and deletion of outdated indexed records.
+- More figure/table regression coverage and multi-document retrieval tests.
+- Stronger evaluations of factual answer quality.
+- Improved layout extraction and ambiguity handling.
 
 ## Project status
 
-
-
-\*\*Version 1 — Functional command-line prototype\*\*
-
-
-
-Supports TXT, PDF, webpage, and image-based knowledge retrieval using locally running models.
-
+**Functional research prototype:** CLI and Streamlit access, local multimodal indexing, structured PDF retrieval, and automated regression tests.
