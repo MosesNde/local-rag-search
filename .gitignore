@@ -1,4 +1,3 @@
-
 # Python environment
 .venv/
 __pycache__/
@@ -9,14 +8,19 @@ __pycache__/
 .env.*
 
 # Local documents and images
-data/documents/*
-data/images/*
+data/documents/
+data/images/
 
 # Persistent vector database
-data/chroma/*
+data/chroma/
 
 # Local URL list
 data/urls.txt
+
+# Generated evaluation reports and experiments
+data/retrieval_tests/
+data/results/
+data/outputs/
 
 # Editor and operating system files
 .vscode/
@@ -32,3 +36,12 @@ src/pdf_extraction_test.py
 src/url_extraction_test.py
 src/image_extraction_test.py
 src/evaluate_retrieval.py
+
+# Temporary debugging artifacts
+table_detection_debug.pdf
+*.log
+
+# Generated PDF processing artifacts
+data/figure_tests/
+data/figures/
+data/table_tests/
