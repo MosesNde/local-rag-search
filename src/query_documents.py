@@ -708,6 +708,7 @@ def generate_grounded_answer(question, context):
 def parse_metric_record(document):
     """Parse the explicit key/value format emitted by pdf_table_pipeline.py."""
     fields = {}
+    document = re.sub(r"^\s*Row\s+\d+\s*:\s*", "", document, flags=re.I)
     for part in document.split("|"):
         if ":" in part:
             key, value = part.split(":", 1)
@@ -829,6 +830,184 @@ def deterministic_ranking(collection, question):
     return answer, sources
 
 
+
+def _whole_term(text, value):
+    """Match an entire literal value, including technical suffixes such as C++."""
+    return bool(re.search(r"(?<![A-Za-z0-9_+])" + re.escape(str(value))
+                          + r"(?![A-Za-z0-9_+])", text, re.I))
+
+
+def _table_fields(document):
+    """Parse a PDF table row after optional Source/Page/Table/Caption headers.
+
+    Real indexed records start with a multi-line header followed by
+    'Row N: Field: value | Field: value'.  Only the row's fields count.
+    """
+    match = re.search(r"(?m)^\s*Row\s+\d+\s*:\s*", document, re.I)
+    if match:
+        row_text = document[match.end():]
+    else:
+        # Keep compatibility with short test fixtures and other row formats.
+        row_text = re.sub(r"^\s*Row\s+\d+\s*:\s*", "", document, flags=re.I)
+    fields = {}
+    for part in row_text.split("|"):
+        if ":" not in part:
+            continue
+        name, value = part.split(":", 1)
+        name = name.strip().casefold()
+        if name:
+            fields[name] = value.strip()
+    return fields
+
+
+def _query_matched_table_row(question, records):
+    """Select one row only when a distinctive literal category/field is named."""
+    ranked = []
+    for document, meta in records:
+        if meta.get("file_type") != "pdf_table":
+            continue
+        fields = _table_fields(document)
+        category = fields.get("owasp category")
+        if category and _whole_term(question, category):
+            ranked.append((document, meta, fields))
+    return ranked[0] if len(ranked) == 1 else None
+
+
+def _citation_for_explicit(question, answer, records, used_metadata):
+    """Ground limited deterministic table/figure citations in retrieved evidence.
+
+    Return None when the record cannot be verified; caller retains conservative
+    prose citations and must never fall back to a list of retrieved passages.
+    """
+    usable = [(doc, m) for doc, m in records if m in used_metadata]
+    tables = table_references(question)
+    figures = figure_references(question)
+    if len(figures) == 1 and not tables:
+        figure_matches = [(doc, m) for doc, m in usable
+                          if m.get("file_type") == "pdf_figure"
+                          and str(m.get("figure_number")) == str(figures[0])]
+        if len(figure_matches) != 1:
+            return None
+        doc, meta = figure_matches[0]
+        # Look for nontrivial answer content explicitly present in the figure
+        # description, rather than crediting only terms from the question.
+        terms = evidence_terms(answer) - evidence_terms(question)
+        overlap = terms & evidence_terms(doc)
+        if len(overlap) >= 2 and (not terms or len(overlap) / len(terms) >= .40):
+            return answer + " [1]", ["[1] " + format_source(meta)]
+        return None
+    if len(tables) != 1 or figures:
+        return None
+    table_rows = [(doc, m) for doc, m in usable if m.get("file_type") == "pdf_table"
+                  and table_number_matches(m, tables[0])]
+    if not table_rows:
+        return None
+    # Whole-table counts cannot be attributed to an arbitrary single row.
+    if re.search(r"\bhow many\b|\bnumber of\b", question, re.I):
+        match = re.search(r"\b(\d+)\b", answer)
+        row_ids = {str(m.get("row_number")) for _, m in table_rows if m.get("row_number") is not None}
+        if (match and len(row_ids) == int(match.group(1))
+                and len(row_ids) == len(table_rows) and len(row_ids) >= 2):
+            common = table_rows[0][1]
+            source = common.get("source", "Unknown source")
+            label = (f"Table {common['table_number']}" if common.get("table_number") is not None
+                     else common.get("table_label", f"Table {tables[0]}"))
+            page = common.get("page")
+            loc = f"{source} ({label}, page {page}, rows 1-{len(row_ids)})"
+            return answer + " [1]", ["[1] " + loc]
+        return None
+    hit = _query_matched_table_row(question, table_rows)
+    if hit:
+        doc, meta, fields = hit
+        languages = fields.get("most affected languages")
+        # Check every enumerated language, including C / C++ distinction.
+        if languages:
+            items = [v.strip() for v in languages.split(",") if v.strip()]
+            if items and all(_whole_term(answer, item) for item in items):
+                return answer + " [1]", ["[1] " + format_source(meta)]
+    # Highest/lowest metric questions name the model and dataset but not the
+    # winning system. Compute the extremum over all matching reported cells.
+    metric = metric_for_question(question)
+    if metric and re.search(r"\b(highest|lowest|largest|smallest)\b", question, re.I):
+        considered = []
+        for doc, meta in table_rows:
+            fields = parse_metric_record(doc)
+            if not fields or not all(exact_mention(question, fields[k])
+                                     for k in ("model", "dataset")):
+                continue
+            value = parse_numeric_value(fields.get(metric))
+            if value is not None:
+                considered.append((value, fields["system"], meta))
+        if len(considered) >= 2:
+            choose_max = bool(re.search(r"\b(highest|largest)\b", question, re.I))
+            best_value = (max if choose_max else min)(item[0] for item in considered)
+            winners = [item for item in considered if item[0] == best_value]
+            if len(winners) == 1:
+                number, system, meta = winners[0]
+                if _whole_term(answer, system) and _whole_term(answer, f"{number:g}"):
+                    return answer + " [1]", ["[1] " + format_source(meta)]
+    # Exact metric cell, when the requested model, system and dataset all
+    # appear together in the row, and the value matches the answer.
+    if metric:
+        matches = []
+        for doc, meta in table_rows:
+            fields = parse_metric_record(doc)
+            if not fields:
+                continue
+            if not all(exact_mention(question, fields[k]) for k in ("model", "system", "dataset")):
+                continue
+            number = parse_numeric_value(fields.get(metric))
+            if number is None:
+                continue
+            if _whole_term(answer, f"{number:g}"):
+                matches.append(meta)
+        if len(matches) == 1:
+            return answer + " [1]", ["[1] " + format_source(matches[0])]
+    return None
+
+
+def cite_explicit_answer(question, answer, records, used_metadata):
+    """Prefer a verified exact structured citation; never claim context as evidence."""
+    exact = _citation_for_explicit(question, answer, records, used_metadata)
+    if exact:
+        return exact
+    cited, sources = annotate_answer_with_evidence(answer, records, used_metadata)
+    return cited, sources
+
+
+def retrieved_context_sources(records, used_metadata, question):
+    """Return a SMALL provenance list, explicitly NOT verified citations.
+
+    Do not enumerate every retrieved table row as supporting evidence.
+    """
+    metas = [m for m in used_metadata if m.get("source")]
+    if not metas:
+        return []
+    table_nums = table_references(question)
+    if len(table_nums) == 1:
+        selected = [m for m in metas if m.get("file_type") == "pdf_table"
+                    and table_number_matches(m, table_nums[0])]
+        if selected:
+            seen = set()
+            results = []
+            for m in selected:
+                label = (f"Table {m['table_number']}" if m.get("table_number") is not None
+                         else m.get("table_label", f"Table {table_nums[0]}"))
+                page = f", page {m['page']}" if m.get("page") is not None else ""
+                key = f"{m['source']} ({label}{page})"
+                if key not in seen:
+                    seen.add(key)
+                    results.append("Retrieved context (citation unverified): " + key)
+            return results[:2]
+    seen = set()
+    results = []
+    for m in metas:
+        source = m.get("source")
+        if source not in seen:
+            seen.add(source)
+            results.append("Retrieved context (citation unverified): " + format_source(m))
+    return results[:3]
+
 def answer_question(question):
     total_started = time.perf_counter()
     started = time.perf_counter()
@@ -865,10 +1044,10 @@ def answer_question(question):
         profile_log("total=" + seconds(total_started))
         if answer == "INSUFFICIENT_INFORMATION" or not answer:
             return INSUFFICIENT_MESSAGE, []
-        cited_answer, matched_sources = annotate_answer_with_evidence(answer, records, used)
-        return cited_answer, matched_sources or list(dict.fromkeys(
-            format_source(meta) for meta in used if meta.get("source")
-        ))
+        cited, sources = cite_explicit_answer(question, answer, records, used)
+        if not sources:
+            sources = retrieved_context_sources(records, used, question)
+        return cited, sources
 
     if collection.count() == 0:
         return INSUFFICIENT_MESSAGE, []
@@ -899,9 +1078,7 @@ def answer_question(question):
         if sufficient:
             profile_log(f"expanded={stage_number > 1} total={seconds(total_started)}")
             cited_answer, matched_sources = annotate_answer_with_evidence(answer, records, used)
-            sources = matched_sources or list(dict.fromkeys(
-                format_source(meta) for meta in used if meta.get("source")
-            ))
+            sources = matched_sources or retrieved_context_sources(records, used, question)
             return cited_answer, sources
     profile_log("no_sufficient_answer total=" + seconds(total_started))
     return INSUFFICIENT_MESSAGE, []
