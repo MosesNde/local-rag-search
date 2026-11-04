@@ -22,36 +22,57 @@ Sources can include filenames, pages, table/figure numbers, and chunk references
 
 ## Architecture
 
-### Indexing
+The Local RAG Search Engine combines local document indexing, semantic
+retrieval, LangGraph-based conversation routing, persistent memory,
+and source-aware answer generation.
 
-```text
-TXT/PDF text and webpages ---> Text extraction and chunking ----┐
-Images ---------------------> Vision-generated descriptions ----┤
-PDF figures ----------------> Crop, describe, validate ----------┤
-PDF tables -----------------> Extract, structure, validate ------┤
-                                                                 v
-                                                        nomic-embed-text
-                                                                 |
-                                                                 v
-                                                        ChromaDB documents
-```
+### System overview
 
-### Question answering
+![System Architecture Overview](docs/images/1.png)
 
-```text
-Question
-   |
-   +-- Explicit table/figure reference? --> Source-aware lookup
-   |                                        (some exact table answers in Python)
-   |
-   +-- Otherwise --> Embedding --> Semantic search
-                                      |
-                                      v
-                              Neighboring text chunks
-   |
-   v
-Retrieved evidence --> qwen3:8b --> Answer and retrieved sources
-```
+### Document indexing
+
+The indexing pipeline processes different content types:
+
+- **TXT, PDF, and webpages:** Extract and chunk text.
+- **Images:** Generate searchable descriptions using a vision model.
+- **PDF figures:** Crop, describe, and validate figures.
+- **PDF tables:** Extract, structure, and validate table content.
+
+The processed content is embedded using `nomic-embed-text` and
+stored in ChromaDB for semantic retrieval.
+
+### Question answering and LangGraph routing
+
+![Question Answering and Routing](docs/images/2.png)
+
+LangGraph routes questions through three paths:
+
+- **New topic:** Retrieve relevant evidence from indexed documents.
+- **Follow-up:** Use recent conversation context and supporting evidence.
+- **Recall:** Retrieve information from earlier chat discussions.
+
+The query engine also supports source-aware table and figure lookup,
+including some deterministic table-answering operations.
+
+### Citations and evidence verification
+
+![Citation and Evidence Viewer](docs/images/3.png)
+
+The application provides clickable citations, PDF and TXT evidence
+viewing, table and figure highlighting, and provenance labels that
+distinguish document evidence, conversation recall, and generated examples.
+
+### Persistent conversation memory
+
+![Conversation Memory and Chat Recall](docs/images/4.png)
+
+SQLite stores the original chat messages. Older conversations are
+summarized into append-only memory segments while recent messages
+remain available verbatim.
+
+The recall workflow can use both the saved summaries and original
+conversation history.
 
 ## Requirements
 
@@ -243,3 +264,4 @@ Local documents, images, ChromaDB records, extracted figures/tables, and generat
 ## Project status
 
 **Functional research prototype:** CLI and Streamlit access, local multimodal indexing, structured PDF retrieval, and automated regression tests.
+
