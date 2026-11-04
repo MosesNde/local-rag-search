@@ -45,3 +45,8 @@ table_detection_debug.pdf
 data/figure_tests/
 data/figures/
 data/table_tests/
+# Persistent conversation memory
+data/chat_history.sqlite3
+
+# Local evaluation datasets and generated results
+data/evaluation/

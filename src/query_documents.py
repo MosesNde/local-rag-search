@@ -1,5 +1,6 @@
 """Query local ChromaDB documents with explicit PDF table/figure references."""
 import re
+import json
 import math
 import os
 import sys
@@ -643,8 +644,49 @@ def answer_ends_cleanly(answer):
     return False
 
 
-def generate_grounded_answer(question, context):
+def wants_concrete_example(question):
+    """Identify requests for an illustrative scenario, not mere mentions of examples."""
+    return bool(re.search(
+        r"\b(?:give|show|provide|create|write|generate|walk\s+through|illustrate)\b"
+        r"[^\n?]{0,100}\b(?:example|scenario|case\s+study|illustration)\b"
+        r"|\b(?:hypothetical|practical|concrete|real[- ]world)\s+"
+        r"(?:example|scenario)\b",
+        question, re.I))
+
+
+def generate_grounded_answer(question, context, answer_mode="direct", conversation_context=""):
+    mode_guidance = ""
+    if answer_mode == "reason":
+        mode_guidance = (
+            "The user requests analytical reasoning. Answer using exactly two paragraphs "
+            "with the headings 'Documented premise:' and 'Reasoned inference:'. "
+            "In Documented premise, state specific facts actually present in the retrieved "
+            "source context, without speculation. In Reasoned inference, draw a cautious "
+            "conclusion from those facts and explicitly say it is a possibility rather "
+            "than an experimentally established result. Do NOT insert citation markers: "
+            "the program separately attributes only the documented premise. "
+            "If you cannot identify a relevant documented premise, reply exactly "
+            "INSUFFICIENT_INFORMATION. "
+        )
+    # Examples are creative illustrations of supported mechanisms, not source facts.
+    # The model must give a situation/action/outcome rather than repeat a definition.
+    example_guidance = (
+        "The user requests an example, not another explanation. Start with "
+        "'Hypothetical example:' and describe ONE specific situation: who/what "
+        "is involved, what concrete action happens, and what an observer might "
+        "see as a result. For instance, use a named sample document, query, "
+        "tool request, or dataset when relevant; explicitly treat invented details "
+        "as illustrative rather than facts reported by the source. "
+        "Use the retrieved context ONLY for the underlying mechanism; do not "
+        "assert the scenario occurred in the document, invent experimental "
+        "results, or guarantee an outcome. If behavior is contingent, say 'might' "
+        "or 'could'. Keep the example to 3-5 complete sentences. "
+        "If the context does not establish the underlying mechanism, answer "
+        "exactly INSUFFICIENT_INFORMATION. "
+        if wants_concrete_example(question) else ""
+    )
     prompt = (
+        mode_guidance + example_guidance +
         "Answer using ONLY the retrieved context. If the evidence is insufficient, "
         "reply exactly INSUFFICIENT_INFORMATION. Never guess. "
         "For questions about how something works, give its essential steps and "
@@ -655,11 +697,13 @@ def generate_grounded_answer(question, context):
         "missing values are not zero. "
         "For figures, describe only supported labels and relationships; do not invent "
         "numerical values.\n\n"
-        "Context:\n" + context + "\n\nQuestion:\n" + question
+        "Previous conversation (for reference resolution, NOT documentary evidence):\n"
+        + conversation_context[:2400] + "\n\nContext:\n" + context
+        + "\n\nQuestion:\n" + question
     )
     is_complex = (table_references(question) or figure_references(question)
                   or wants_broader_context(question) or is_multi_part_question(question))
-    max_output_tokens = 256 if is_complex else 120
+    max_output_tokens = 320 if answer_mode == "reason" else (256 if is_complex or example_guidance else 120)
 
     for attempt in range(2):
         generation_started = time.perf_counter()
@@ -688,8 +732,10 @@ def generate_grounded_answer(question, context):
                 + f" limit={max_output_tokens} done_reason={reason}"
                 + f" complete={complete} attempt={attempt + 1}"
             )
-        if answer == "INSUFFICIENT_INFORMATION":
-            return answer
+        # Some models append the sentinel after an explanatory sentence.
+        # Treat any standalone sentinel as a refusal to answer, never render it.
+        if re.search(r"\bINSUFFICIENT_INFORMATION\b", answer):
+            return "INSUFFICIENT_INFORMATION"
         if complete and not limit_reached:
             return answer
         if attempt == 0:
@@ -1008,12 +1054,203 @@ def retrieved_context_sources(records, used_metadata, question):
             results.append("Retrieved context (citation unverified): " + format_source(m))
     return results[:3]
 
-def answer_question(question):
+def cite_reasoned_answer(answer, records, used_metadata):
+    """Cite documented premises only; never mislabel an inference as a reported finding.
+
+    Lexical matching is conservative and not a proof of entailment. Unmatched
+    premises are displayed without citation, with the lack of verification explicit.
+    """
+    premise_match = re.search(
+        r"(?is)\bDocumented premise\s*:\s*(.*?)\s*\bReasoned inference\s*:\s*(.*)$",
+        answer.strip(),
+    )
+    if premise_match:
+        premise, inference = (part.strip() for part in premise_match.groups())
+    else:
+        # The model did not follow the two-part format: do not invent a premise.
+        return ("**Reasoned analysis (not verified as a document finding):** "
+                + re.sub(r"\[\d+\]", "", answer).strip(), [])
+    if not premise or not inference:
+        return ("**Reasoned analysis (not verified as a document finding):** "
+                + re.sub(r"\[\d+\]", "", answer).strip(), [])
+    premise = re.sub(r"\[\d+\]", "", premise).strip()
+    inference = re.sub(r"\[\d+\]", "", inference).strip()
+    cited_premise, sources = annotate_answer_with_evidence(premise, records, used_metadata)
+    # All references, if any, belong ONLY to the premise paragraph.
+    premise_title = ("**Documented premise (matched to retrieved evidence):** "
+                     if sources else "**Documented premise (citation not verified):** ")
+    return (premise_title + cited_premise + "\n\n"
+            + "**Reasoned inference (not a finding established by the document):** "
+            + inference, sources)
+
+
+
+
+# --------------------------------------------------
+# Source-balanced multi-document comparison
+# --------------------------------------------------
+COMPARISON_REQUEST = re.compile(
+    r"\b(?:compare|contrast|differences?|similarities|versus|vs\.?|"
+    r"how\s+do(?:es)?\s+.+\s+(?:differ|compare))\b", re.I
+)
+GENERIC_FILENAME_WORDS = {
+    'the','and','for','with','from','based','standard','paper','study',
+    'research','data','dataset','software','comprehensive','approach',
+    'analysis','evaluation','system','systems','pdf','top','ten'
+}
+
+
+def named_comparison_sources(collection, question):
+    """Resolve two *explicitly named* indexed PDFs; avoid guessing sources.
+
+    A short distinctive token such as 'AgentChaos' or 'OWASP' must be present
+    in the question. A plain word such as 'dataset' cannot resolve a PDF.
+    """
+    if not COMPARISON_REQUEST.search(question):
+        return []
+    q = question.casefold()
+    meta = collection.get(include=['metadatas']).get('metadatas') or []
+    names = sorted({m.get('source') for m in meta
+                    if isinstance(m, dict) and str(m.get('source','')).lower().endswith('.pdf')})
+    scores = []
+    for name in names:
+        stem = Path(name).stem.casefold()
+        words = [w for w in re.findall(r'[a-z0-9]+', stem)
+                 if len(w) >= 4 and w not in GENERIC_FILENAME_WORDS]
+        matched = [w for w in set(words) if re.search(r'(?<![a-z0-9])'+re.escape(w)+r'(?![a-z0-9])', q)]
+        exact = name.casefold() in q or stem.replace('_',' ') in q
+        # Require distinctive names, not generic common terms.
+        if exact or matched:
+            scores.append((100 if exact else 10*len(matched)+max(map(len,matched)), name))
+    scores.sort(key=lambda x:(-x[0],x[1]))
+    # The initial version intentionally supports only exactly two clear matches.
+    return [name for _, name in scores[:2]] if len(scores) >= 2 else []
+
+
+def balanced_comparison(collection, question, conversation_context=''):
+    """Retrieve a separate contextual passage set for each named PDF.
+
+    This is read-only and does not alter the existing ChromaDB collection.
+    """
+    names = named_comparison_sources(collection, question)
+    if len(names) != 2:
+        return None
+    groups = []
+    for name in names:
+        # The same requested comparison aspects are retained, but each
+        # embedding is focused on ONE named entity.
+        subject = Path(name).stem.replace('_', ' ')
+        search_text = (f'{subject}: purpose objectives methods approach '
+                       'evaluation vulnerabilities weaknesses limitations. '
+                       f'User comparison: {question[:550]}')
+        embedding = ollama.embed(model=EMBEDDING_MODEL, input=search_text)['embeddings'][0]
+        found = semantic_search_by_vector(collection, embedding, name, 5)
+        if not found:
+            return (f'I could not find sufficiently relevant evidence in {name} '
+                    'for this comparison. No comparison was generated.', [])
+        expanded = add_neighboring_text_chunks(collection, found, max_added=2)
+        context, used = build_context(expanded, 7000)
+        if not context:
+            return (f'I could not build usable evidence from {name}. '
+                    'No comparison was generated.', [])
+        groups.append((name, expanded, used, context))
+    # Force balanced input budgets: one PDF cannot crowd out the other.
+    joined = '\n\n'.join(f'=== SOURCE {i+1}: {name} ===\n{context}'
+                       for i,(name,_,_,context) in enumerate(groups))
+    prompt = (
+        'Compare the TWO source documents using ONLY the evidence below. '
+        'You must cover both separately, then explain similarities and differences '
+        'in objectives, methods, and weaknesses addressed. '
+        'Do not confuse agent robustness with software vulnerabilities. '
+        'Use the exact headings "Source A:", "Source B:", and "Comparison:". '
+        'Describe one or two important documented facts about each in its section. '
+        'In the Comparison section, distinguish facts from your own interpretations '
+        'and avoid unsupported claims. Do not claim that the approaches have no overlap, ''are mutually exclusive, or can be directly ranked without explicit evidence. ''Say their primary focus differs, while possible overlaps need further evaluation. ''Keep the comparison concise, without repeating either source summary. ''Do not include citation markers; the program '
+        'will annotate evidence separately. If either source lacks adequate information, '
+        'reply INSUFFICIENT_INFORMATION. '
+        'Conversation context is for resolving references, never evidence:\n'
+        + conversation_context[-1600:] + '\n\nRetrieved documents:\n' + joined
+        + '\n\nQuestion: ' + question
+    )
+    response = ollama.chat(model=ANSWER_MODEL, messages=[{'role':'user','content':prompt}],
+                           think=False, options={'num_predict':700})
+    answer = response['message']['content'].strip()
+    if not answer or answer == 'INSUFFICIENT_INFORMATION':
+        return INSUFFICIENT_MESSAGE, []
+    pieces = re.search(
+        r'(?is)\bSource A:\s*(.*?)\s*\bSource B:\s*(.*?)\s*\bComparison:\s*(.*)',answer)
+    if not pieces:
+        # Don't offer an unsupported freeform comparison without provenance.
+        return ('Could not reliably separate the two documents in the generated '
+                'comparison. Please retry the question.', [])
+    # The model sometimes emits Markdown heading syntax inside the three
+    # captured sections. Normalize it here, before assembling our own headings.
+    def clean_comparison_part(raw):
+        raw = raw.strip()
+        raw = re.sub(r'^\\s*(?:\\*\\*|__)+\\s*', '', raw)
+        raw = re.sub(r'\\s*(?:\\*\\*|__)+\\s*$', '', raw)
+        raw = re.sub(r'(?m)^\\s*(?:\\*\\*|__)+\\s*$', '', raw)
+        raw = re.sub(r'\\n{3,}', '\n\n', raw)
+        return raw.strip()
+
+    parts = [clean_comparison_part(p) for p in pieces.groups()]
+
+    # Allocate evidence locators separately for each paper. This guarantees
+    # that a source is not silently dropped when sentence-level lexical
+    # matching fails. Provenance alone is NOT claim-level verification.
+    formatted, numbered_sources = [], []
+    for idx in range(2):
+        name, records, used, _ = groups[idx]
+        cited, matched = annotate_answer_with_evidence(parts[idx], records, used)
+        local_ids = {}
+        for old_id, locator in enumerate(matched, 1):
+            new_id = len(numbered_sources) + 1
+            local_ids[str(old_id)] = str(new_id)
+            numbered_sources.append(
+                f'[{new_id}] ' + re.sub(r'^\[\d+\]\s*', '', locator))
+        cited = re.sub(r'\[(\d+)\]',
+                       lambda m: '[' + local_ids.get(m.group(1), m.group(1)) + ']',
+                       cited)
+        if not matched:
+            # Preserve the provenance of the actual indexed passage. A source
+            # link says where the premise was retrieved, not that every
+            # generated statement has been independently verified.
+            eligible = [m for m in used if m.get('source', '').casefold() == name.casefold()]
+            if eligible:
+                best = eligible[0]
+                number = len(numbered_sources) + 1
+                numbered_sources.append(f'[{number}] ' + format_source(best))
+                cited += (f'\n\nSupporting source context [{number}] '
+                          '(individual claims not verified).')
+        heading = f'**Source {"AB"[idx]} ({name})**'
+        formatted.append(heading + '\n' + cited)
+    # This paragraph is a model-generated synthesis, not a source quotation.
+    # Do not add spurious direct citations to its conclusions.
+    formatted.append(
+        '**Comparison (evidence-based synthesis)**\n\n'
+        + parts[2] + '\n\n'
+        + '*The comparison describes differences in primary objectives; '
+        'it does not establish that the approaches have no overlapping '
+        'security implications or directly comparable effectiveness.*'
+    )
+    return '\n\n'.join(formatted), numbered_sources
+
+
+
+def answer_question(question, answer_mode="direct", conversation_context=""):
     total_started = time.perf_counter()
     started = time.perf_counter()
     client = chromadb.PersistentClient(path=str(DB_PATH))
     collection = client.get_collection(name="documents")
     profile_log("database_connection=" + seconds(started) + f" records={collection.count()}")
+
+    # Two explicit document names require balanced retrieval, before
+    # generic semantic ranking or the single-document explicit route.
+    if COMPARISON_REQUEST.search(question):
+        comparison = balanced_comparison(collection, question, conversation_context)
+        if comparison is not None:
+            profile_log("route=balanced_comparison total=" + seconds(total_started))
+            return comparison
 
     started = time.perf_counter()
     numeric_result = deterministic_ranking(collection, question)
@@ -1040,10 +1277,12 @@ def answer_question(question):
         profile_log(f"context_build={seconds(started)} chars={len(context)}")
         if not context:
             return INSUFFICIENT_MESSAGE, []
-        answer = generate_grounded_answer(question, context)
+        answer = generate_grounded_answer(question, context, answer_mode, conversation_context)
         profile_log("total=" + seconds(total_started))
         if answer == "INSUFFICIENT_INFORMATION" or not answer:
             return INSUFFICIENT_MESSAGE, []
+        if answer_mode == "reason":
+            return cite_reasoned_answer(answer, records, used)
         cited, sources = cite_explicit_answer(question, answer, records, used)
         if not sources:
             sources = retrieved_context_sources(records, used, question)
@@ -1072,11 +1311,13 @@ def answer_question(question):
         profile_log(f"stage={stage_number} context_build={seconds(started)} chars={len(context)} sources={len(used)}")
         if not context:
             continue
-        answer = generate_grounded_answer(question, context)
+        answer = generate_grounded_answer(question, context, answer_mode, conversation_context)
         sufficient = bool(answer and answer != "INSUFFICIENT_INFORMATION")
         profile_log(f"stage={stage_number} sufficient={sufficient} answer_chars={len(answer)}")
         if sufficient:
             profile_log(f"expanded={stage_number > 1} total={seconds(total_started)}")
+            if answer_mode == "reason":
+                return cite_reasoned_answer(answer, records, used)
             cited_answer, matched_sources = annotate_answer_with_evidence(answer, records, used)
             sources = matched_sources or retrieved_context_sources(records, used, question)
             return cited_answer, sources
@@ -1084,7 +1325,480 @@ def answer_question(question):
     return INSUFFICIENT_MESSAGE, []
 
 
+
+# Conversation support is kept in the retrieval engine. Existing standalone
+# answer_question() and command-line behavior remain backwards compatible.
+EXPLANATION_REQUEST = re.compile(
+    r"^\s*(?:(?:please|can you|could you|would you)\s+)*"
+    r"(?:explain(?:\s+(?:it|that|this))?(?:\s+again)?|"
+    r"(?:summari[sz]e|simplify|clarify)(?:\s+(?:it|that|this))?|"
+    r"(?:give|provide|show)(?:\s+me)?\s+(?:an?\s+)?example(?:\s+of\s+(?:it|that|this))?|"
+    r"(?:put|say)\s+(?:it|that|this)\s+in\s+(?:simple|plain)\s+(?:terms|words))"
+    r"(?:\s+in\s+(?:simple|plain)\s+(?:terms|words))?\s*[?.!]*\s*$", re.I)
+REFERENCE_REQUEST = re.compile(
+    r"\b(?:it|its|this|that|these|those|they|them|their)\b|^\s*(?:what about|how about)\b", re.I)
+REASONING_REQUEST = re.compile(
+    r"\b(?:limitations?|drawbacks?|tradeoffs?|trade-offs?|implications?|infer|inference|"
+    r"hypothe(?:tical|sis)|what if|why might|why would|could (?:this|it)|"
+    r"how (?:could|would) (?:i|we)|apply (?:it|this))\b", re.I)
+
+
+def _recent_context(history, max_messages=10):
+    result = []
+    for m in history[-max_messages:]:
+        if m.get('role') not in ('user', 'assistant'):
+            continue
+        content = re.sub(r'\[\d+\]', '', m.get('content', '')).strip()
+        if content:
+            result.append(f"{m['role']}: {content[:450]}")
+    return '\n'.join(result)[-3000:]
+
+
+def _topic_anchor(history):
+    for m in reversed(history[-30:]):
+        if m.get('role') != 'user':
+            continue
+        q = m.get('content', '').strip()
+        if q and not EXPLANATION_REQUEST.fullmatch(q) and not REFERENCE_REQUEST.search(q):
+            return q[:600]
+    return None
+
+
+def _last_cited_answer(history):
+    for msg in reversed(history[-16:]):
+        if msg.get('role') != 'assistant':
+            continue
+        sources = msg.get('sources') or []
+        valid = {m.group(1): src for src in sources if (m := re.match(r'^\[(\d+)\]\s+', src))}
+        cited = list(dict.fromkeys(re.findall(r'\[(\d+)\]', msg.get('content', ''))))
+        numbers = [n for n in cited if n in valid]
+        if numbers:
+            return msg, numbers, valid
+    return None
+
+
+def _last_grounded_answer(history):
+    """Find latest assistant answer with evidence; never steal older topic citations."""
+    for message in reversed(history):
+        if message.get('role') != 'assistant':
+            continue
+        content = (message.get('content') or '').strip()
+        sources = message.get('sources') or []
+        if content and sources:
+            return message
+        # The latest answer was unsupported: don't jump backward to a
+        # different answer and attach the wrong document's citations.
+        if content:
+            break
+    return None
+
+
+def _retrieve_followup_evidence(previous, history):
+    """Recover relevant *actual passages* for an uncited but retrieved answer.
+
+    Do not promote 'Retrieved context (citation unverified)' into a verified
+    citation. The returned passages are grounding context, not claim-level proof.
+    """
+    candidates = set()
+    for src in previous.get('sources') or []:
+        found = re.search(r'([^/\\\n]+?\.pdf)\s*\(', src, re.I)
+        if found:
+            candidates.add(found.group(1).strip())
+        found = re.search(r'(?<![/\w])([\w.+-]+\.txt)\s*\(', src, re.I)
+        if found:
+            candidates.add(found.group(1).strip())
+    anchor = _topic_anchor(history) or ''
+    found = explicit_pdf_name(anchor)
+    if found:
+        candidates.add(found)
+    if not candidates:
+        return None
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    collection = client.get_collection(name='documents')
+    question = anchor or (previous.get('content') or '')[:300]
+    vector = ollama.embed(model=EMBEDDING_MODEL, input=question)['embeddings'][0]
+    for source in sorted(candidates):
+        records = semantic_search_by_vector(collection, vector, source, 5)
+        if records:
+            context, used = build_context(records, 6000)
+            if context and used:
+                return context, source
+    return None
+
+
+def _reframe_previous(question, history):
+    """Transform a cited or retrieved answer, labeling hypothetical evidence honestly."""
+    previous = _last_grounded_answer(history)
+    if previous is None:
+        return ('I could not find supporting document context for the previous '
+                'topic. Please ask a document-specific question first.', [])
+    is_example = bool(re.search(r'\bexample\b', question, re.I))
+    prior_text = re.sub(r'\[\d+\]', '', previous['content']).strip()
+    valid = {m.group(1): src for src in previous.get('sources') or []
+             if (m := re.match(r'^\[(\d+)\]\s+', src))}
+    cited = list(dict.fromkeys(re.findall(r'\[(\d+)\]', previous['content'])))
+    numbers = [num for num in cited if num in valid]
+    evidence_context = ''
+    # A retrieved but unverified source is provenance, not proof of a claim.
+    # For an illustrative transformation, the previous answer itself supplies
+    # the conceptual premise. Do not make a second search a prerequisite.
+    unverified_sources = [
+        src for src in previous.get('sources') or []
+        if src.startswith('Retrieved context (citation unverified): ')
+    ]
+    # Keep the original source locator (page/chunk) and status intact.
+    unverified_source = unverified_sources[0] if unverified_sources else None
+    if not numbers and not unverified_source:
+        return ('The previous explanation has no identifiable supporting source; '
+                'please ask a document-specific question first.', [])
+
+    instructions = (
+        "Write ONE concrete hypothetical scenario that illustrates the mechanism "
+        "in the previous explanation. Start with 'Hypothetical example:'. "
+        "Name a sample user or actor, a specific document/query/tool/action, "
+        "and a possible observable outcome. Example structure: 'Imagine [actor] "
+        "does [specific action]. The system [supported mechanism]. The result "
+        "might be [plausible outcome].' Do NOT simply explain the mechanism "
+        "again. Invent illustrative scenario details only; do not invent facts "
+        "about the paper, quantitative results, or guaranteed failures. "
+        "Do not claim this scenario happened in the document. "
+        if is_example else
+        "Explain the previous answer in simple everyday language, without adding facts. "
+    )
+    prompt = (
+        "Continue the SAME subject. " + instructions
+        + "Use only the previous answer and supplied supporting passages as factual premises. "
+        "Do not output any citation markers; citation status is handled separately. "
+        "Keep it to 2-5 complete sentences and avoid new numerical claims.\n"
+        + "Recent conversation:\n" + _recent_context(history, 8)
+        + "\nPrevious answer:\n" + prior_text[:2200]
+        + ("\nRetrieved supporting passages (not independently claim-verified):\n"
+           + evidence_context if evidence_context else '')
+        + "\nUser request:\n" + question + "\nResponse:"
+    )
+    response = ollama.chat(model=ANSWER_MODEL,
+                           messages=[{'role': 'user', 'content':prompt}],
+                           think=False, options={'num_predict':350})
+    result = re.sub(r'\[\d+\]', '', response['message']['content']).strip()
+    if not result or not re.search(r'[.!?]$', result):
+        return ('The generated follow-up was incomplete. Please retry.', [])
+    old_numbers = set(re.findall(r'(?<!\w)\d+(?:\.\d+)?(?!\w)', prior_text+evidence_context))
+    new_numbers = set(re.findall(r'(?<!\w)\d+(?:\.\d+)?(?!\w)', result))
+    if not new_numbers.issubset(old_numbers):
+        return ('The generated follow-up introduced unsupported numbers. '
+                'Please retry with a more specific request.', [])
+    sources = [valid[n] for n in numbers]
+    if is_example:
+        if not result.casefold().startswith('hypothetical example:'):
+            result = '**Hypothetical example:** ' + result
+        if numbers:
+            marker = ' '.join(f'[{num}]' for num in numbers)
+            result += ('\n\n*This example is AI-generated, not reported in the document. '
+                       'The underlying mechanism is supported by the earlier cited '
+                       'evidence ' + marker + '.*')
+        else:
+            result += ('\n\n*This example is AI-generated, not reported in the document. '
+                       'It is based on the earlier explanation, which referenced ' + unverified_source.removeprefix('Retrieved context (citation unverified): ')
+                       + '; individual claims have not been citation-verified.*')
+            sources = [unverified_source]
+    elif numbers:
+        result += ' ' + ' '.join(f'[{num}]' for num in numbers)
+    else:
+        result += ('\n\n*Based on retrieved context from ' + unverified_source
+                   + ' (claim-level citation unverified).*')
+        sources = [unverified_source]
+    return result, sources
+
+
+
+# Context condensing keeps the full original chat in SQLite. Summary is ONLY
+# conversational context; it is never accepted as source evidence for citations.
+RECENT_VERBATIM_MESSAGES = 12
+SUMMARY_BATCH_MESSAGES = 8
+# This matches the SQLite chat_summaries column's existing size validation.
+MAX_SUMMARY_CHARS = 10000
+MAX_BATCH_NOTE_CHARS = 900
+
+
+def condense_older_history(history, previous_summary='', start_message_index=0):
+    """Append one immutable, traceable summary segment per eligible message batch.
+
+    Earlier segments are copied without being rewritten by the LLM. The
+    source user questions are included verbatim (up to 220 chars each) to
+    preserve topic anchors even when the generated batch note is incomplete.
+    If the limit is reached or summarization fails, the checkpoint does not
+    advance. The full SQLite chat archive is always retained.
+    """
+    eligible = max(0, len(history) - RECENT_VERBATIM_MESSAGES)
+    batch_count = min(SUMMARY_BATCH_MESSAGES, eligible)
+    if batch_count == 0:
+        return previous_summary, 0
+    if not isinstance(start_message_index, int) or start_message_index < 0:
+        return previous_summary, 0
+    if len(previous_summary) > MAX_SUMMARY_CHARS:
+        return previous_summary, 0
+
+    batch = history[:batch_count]
+    transcript = []
+    verbatim_topics = []
+    for offset, message in enumerate(batch):
+        role = message.get('role')
+        if role not in {'assistant', 'user'}:
+            return previous_summary, 0
+        content = str(message.get('content') or '').strip()
+        content = re.sub(r'\[\d+\]', '', content)
+        if role == 'user' and content:
+            # Preserve the actual topic/question independently of the LLM summary.
+            verbatim_topics.append(f'- Message {start_message_index + offset + 1}: {content[:220]}')
+        transcript.append(f'{role}: {content[:800]}')
+
+    prompt = (
+        'Write a concise note describing ONLY the following batch of earlier '
+        'messages from ONE conversation. Do not rewrite or summarize any older '
+        'memory. Preserve significant earlier conclusions, doubts, user goals, '
+        'and distinctions between source evidence and hypotheses. Do not invent '
+        'facts and never claim hypotheses were proven. Use at most 110 words. '
+        'Output only the batch note, no headings.\n\n'
+        + '\n'.join(transcript)
+    )
+    try:
+        response = ollama.chat(
+            model=ANSWER_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            think=False, options={'num_predict':220, 'temperature':0},
+        )
+        note = response['message']['content'].strip()
+        if not (20 <= len(note) <= MAX_BATCH_NOTE_CHARS):
+            return previous_summary, 0
+        if note.casefold() in {'insufficient_information', 'none'}:
+            return previous_summary, 0
+    except Exception as exc:
+        profile_log('summary_skip=' + type(exc).__name__)
+        return previous_summary, 0
+
+    begin = start_message_index + 1
+    finish = start_message_index + batch_count
+    segment = (
+        f'[Chat messages {begin}-{finish}]\n'
+        'User topics (original questions):\n'
+        + ('\n'.join(verbatim_topics) if verbatim_topics else '- No user question in this batch')
+        + '\nBatch discussion note (generated; not verified document evidence):\n'
+        + note + '\n'
+    )
+    new_summary = previous_summary.rstrip() + ('\n\n' if previous_summary.strip() else '') + segment
+    if len(new_summary) > MAX_SUMMARY_CHARS:
+        # Never discard old segments or advance the watermark merely to fit.
+        profile_log('summary_full; checkpoint left unchanged')
+        return previous_summary, 0
+    return new_summary, batch_count
+
+
+def conversation_memory_context(summary):
+    if not summary:
+        return ''
+    return ('Older chat memory (not verified document evidence; never cite it):\n'
+            + summary[:MAX_SUMMARY_CHARS] + '\n')
+
+
+def resolve_conversation_intent(question, history, summary=""):
+    """Use the active chat to interpret EVERY incoming question before retrieval.
+
+    Model output is untrusted routing advice: cap its size and select from
+    known intent categories. Documentary answers still come from the RAG engine.
+    """
+    if not history:
+        return {'intent': 'research', 'standalone_question': question}
+
+    prompt = (
+        "You resolve the meaning of the latest message in one chat. "
+        "Return ONLY a JSON object with two string fields: "
+        "intent (one of: rewrite, example, research) and standalone_question. "
+        "Use earlier messages to resolve pronouns and omitted subjects. "
+        "An example request (including 'practical example', 'real-world example', "
+        "'show me an example') has intent example when it refers to the prior topic. "
+        "Requests to explain or summarize the prior answer have intent rewrite. "
+        "Requests for new facts, comparisons or limitations have intent research. "
+        "If the latest user message names a new subject, do NOT force it to the old one. "
+        "Never answer the question; only restate the latest request in standalone form. "
+        "Never insert factual claims, citations or details not established in the chat. "
+        "Example: earlier question 'How does a vector database help RAG?', "
+        "latest 'Can you give me a practical example?' -> "
+        '{"intent":"example","standalone_question":"Give a practical hypothetical '
+        'example of how a vector database helps retrieval-augmented generation."}.\n'
+        "Chat history:\n" + conversation_memory_context(summary) + _recent_context(history, 12)
+        + "\nLatest user message:\n" + question
+    )
+    try:
+        response = ollama.chat(
+            model=ANSWER_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            think=False, format='json', options={'num_predict':180, 'temperature':0},
+        )
+        raw = response['message']['content'].strip()
+        data = json.loads(raw)
+        intent = data.get('intent')
+        standalone = str(data.get('standalone_question', '')).strip()
+        if (intent in {'rewrite', 'example', 'research'}
+                and 4 <= len(standalone) <= 900
+                and not re.search(r'(?i)\b(?:ignore previous instructions|system prompt)\b',standalone)):
+            return {'intent': intent, 'standalone_question': standalone}
+    except (ValueError, KeyError, TypeError, AttributeError, ollama.ResponseError):
+        pass
+
+    # Safe fallback when an offline model cannot produce a valid JSON route.
+    # Do not retrieve a generic request like 'give an example' in isolation.
+    anchor = _topic_anchor(history)
+    if re.search(r'(?i)\bexample\b', question) and anchor and len(question.split()) <= 12:
+        return {'intent':'example', 'standalone_question':
+                f'Give an illustrative example about: {anchor}'}
+    if (re.search(r'(?i)\b(?:explain|simplify|summari[sz]e|plain terms)\b',question)
+            and anchor and len(question.split()) <= 12):
+        return {'intent':'rewrite', 'standalone_question':f'Explain simply: {anchor}'}
+    if anchor and REFERENCE_REQUEST.search(question):
+        return {'intent':'research', 'standalone_question':
+                question.rstrip(' ?') + '. Regarding: ' + anchor}
+    return {'intent': 'research', 'standalone_question': question}
+
+
+# Explicit requests about the conversation are different from questions about
+# documents. Never send these through document retrieval as a substitute for memory.
+CHAT_RECALL_RE = re.compile(
+    r"\b(?:we|you and i|our)\s+(?:discussed|talked about|concluded|decided|identified|said|mentioned)\b"
+    r"|\b(?:earlier|previously|last time)\b.*\b(?:discussed|talked|concluded|decided|identified|mentioned)\b"
+    r"|\b(?:what (?:did|was)|remind me)\b.*\b(?:we|our|earlier)\b",
+    re.I,
+)
+
+
+def select_recall_messages(question, history, max_pairs=5):
+    """Find earlier original chat exchanges by distinctive terms, not recent order.
+
+    Return matching question/answer pairs; never claim that the content has
+    been independently verified against documents.
+    """
+    ignore = {'what','was','were','when','which','where','about','the','that',
+              'this','from','with','have','earlier','previously','discussed',
+              'talked','concluded','said','our','you','your','we','and','for',
+              'could','would','did','does','their','those','they','them','how'}
+    terms = {t for t in re.findall(r'[a-z0-9]+',question.casefold())
+             if len(t)>=4 and t not in ignore}
+    scored=[]
+    for i, message in enumerate(history):
+        if message.get('role') != 'user':
+            continue
+        text = str(message.get('content') or '')
+        words = set(re.findall(r'[a-z0-9]+',text.casefold()))
+        score = sum(3 if len(t)>=8 else 1 for t in terms & words)
+        # The assistant's prior answer can hold the details asked about.
+        answer = str(history[i+1].get('content') or '') if i+1<len(history) and history[i+1].get('role')=='assistant' else ''
+        awords = set(re.findall(r'[a-z0-9]+',answer.casefold()))
+        score += sum(1 for t in terms & awords)
+        if score:
+            scored.append((score,i,text,answer))
+    scored.sort(key=lambda r:(-r[0],r[1]))
+    chosen=sorted(scored[:max_pairs],key=lambda r:r[1])
+    return '\n'.join(f'Earlier user: {user[:550]}\nEarlier assistant: {assistant[:1300]}'
+                     for _,_,user,assistant in chosen)[-6500:]
+
+
+def recall_from_chat(question, history, summary):
+    """Answer chat-history recall without inventing document-grounded citations.
+
+    Summaries are helpful memory, but the original chat remains authoritative;
+    if no relevant prior discussion is present in this chat, say so clearly.
+    """
+    transcript = select_recall_messages(question, history)
+    memory = conversation_memory_context(summary) + transcript
+    if not memory.strip():
+        return ('I cannot find an earlier discussion of that topic in this chat. '
+                'Try opening the conversation where it was discussed.'), []
+
+    prompt = (
+        'You are recalling what was actually discussed in ONE saved chat. '
+        'This is a conversation-memory task, not a new research question. '
+        'Use ONLY the supplied chat messages and the condensed summary. '
+        'Do not infer a fresh answer from general knowledge or document excerpts. '
+        'If the requested discussion cannot be identified in this chat, set '
+        'found=false. If found=true, summarize the earlier discussion faithfully '
+        'and briefly; distinguish a prior hypothesis from a documented finding. '
+        'Never claim an unverified prior model answer is a proven fact. '
+        'Return ONLY JSON with keys found (boolean) and answer (string); '
+        'do not include Markdown formatting or citation markers.\n\n'
+        'Relevant chat history (not independently verified evidence):\n'
+        + memory[:8500] + '\n\nRecall request:\n' + question
+    )
+    try:
+        response = ollama.chat(
+            model=ANSWER_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            think=False, format='json',
+            options={'num_predict':240, 'temperature':0},
+        )
+        data = json.loads(response['message']['content'])
+        answer = str(data.get('answer', '')).strip()
+        if data.get('found') is True and 15 <= len(answer) <= 1500:
+            answer = re.sub(r'\[(?:\d+)\]', '', answer).strip()
+            return ('**From our earlier discussion in this chat:** '
+                    + answer + '\n\n'
+                    '*Conversation recall, not independently verified against the paper.*'), []
+    except Exception as exc:
+        profile_log('chat_recall_failed=' + type(exc).__name__)
+    return ('I could not reliably find that earlier discussion in this chat. '
+            'This is a chat-memory limitation, not evidence that the paper '
+            'does not discuss the topic.'), []
+
+
+def answer_conversation(question, history, summary="", original_recall_history=None):
+    """Resolve references on every turn, then use citations and RAG as appropriate."""
+    history = [m for m in history if m.get('role') in ('user', 'assistant')][-30:]
+    if CHAT_RECALL_RE.search(question):
+        return recall_from_chat(question, original_recall_history or history, summary)
+    route = resolve_conversation_intent(question, history, summary)
+    intent = route['intent']
+    resolved = route['standalone_question']
+    if intent in {'example', 'rewrite'} and history:
+        # Base invented illustrations on an existing cited explanation, not
+        # a broad semantic search that may discover unrelated Python tutorials.
+        prompt_for_rewrite = ('Give an example of it' if intent == 'example'
+                              else 'Explain it in simple terms')
+        return _reframe_previous(prompt_for_rewrite, history)
+
+    mode = 'reason' if (REASONING_REQUEST.search(resolved) and not wants_concrete_example(question)) else 'direct'
+    answer, sources = answer_question(resolved, answer_mode=mode,
+                                      conversation_context=conversation_memory_context(summary) + _recent_context(history))
+    if mode == 'reason' and answer != INSUFFICIENT_MESSAGE:
+        if 'Reasoned inference:' in answer:
+            answer = answer.replace('Reasoned inference:',
+                '**Reasoned inference (not explicitly stated in the document):**')
+    return answer, sources
+
 def main():
+    if '--conversation-json' in sys.argv:
+        try:
+            payload = json.load(sys.stdin)
+            question = str(payload.get('question', '')).strip()
+            history = payload.get('history', [])
+            if not isinstance(history, list):
+                raise ValueError('history must be a list')
+            earlier_summary = str(payload.get('summary', ''))[:MAX_SUMMARY_CHARS]
+            checkpoint = int(payload.get('covered_messages', 0))
+            if checkpoint < 0:
+                raise ValueError('Invalid memory checkpoint')
+            updated_summary, consumed = condense_older_history(history, earlier_summary, checkpoint)
+            recent = history[consumed:]
+            original_recall_history = payload.get('recall_history')
+            if not isinstance(original_recall_history, list):
+                original_recall_history = None
+            answer, sources = answer_conversation(
+                question, recent, updated_summary, original_recall_history)
+            print(json.dumps({'answer': answer, 'sources': sources,
+                              'summary': updated_summary,
+                              'covered_messages': checkpoint + consumed},
+                             ensure_ascii=False))
+        except Exception as exc:
+            print(json.dumps({'error': f'{type(exc).__name__}: {exc}'}))
+            sys.exit(1)
+        return
     question = input("Enter your question: ").strip()
     if not question:
         print("\nAnswer:\nPlease enter a question.")
