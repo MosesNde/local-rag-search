@@ -4,3 +4,4 @@ PyMuPDF==1.28.2
 requests==2.34.2
 beautifulsoup4==4.15.0
 streamlit==1.66.0
+langgraph==1.2.19

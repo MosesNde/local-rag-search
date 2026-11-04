@@ -1,10 +1,10 @@
 # Local RAG Search Engine
 
-A locally running **retrieval-augmented generation (RAG)** search application built with Python, [Ollama](https://ollama.com/), [ChromaDB](https://www.trychroma.com/), and [Streamlit](https://streamlit.io/).
+A locally running **retrieval-augmented generation (RAG)** search application built with Python, [Ollama](https://ollama.com/), [ChromaDB](https://www.trychroma.com/), [Streamlit](https://streamlit.io/), and [LangGraph](https://www.langchain.com/langgraph).
 
-Index local TXT/PDF documents, images, and webpages, then ask questions using a local language model. The system supports source-aware table lookup, PDF figure descriptions, and neighboring-chunk context.
+Index local TXT/PDF documents, images, and webpages, then ask questions using a local language model. The system supports structured PDF table lookup, figure descriptions, clickable source evidence, persistent conversation history, and context-aware questions.
 
-> **Status:** Functional research/development prototype. Not production-hardened; retrieved sources do not guarantee that every generated claim is correct.
+> **Status:** Functional research/development prototype. Not production-hardened; retrieved sources and displayed citations do not guarantee that every generated claim is correct. This is not yet a native desktop installer.
 
 ## Features
 
@@ -12,19 +12,20 @@ Index local TXT/PDF documents, images, and webpages, then ask questions using a 
 - **Local models:** `nomic-embed-text` embeddings, `qwen3:8b` answers, and `qwen3-vl:8b` image descriptions (configurable).
 - **Persistent knowledge base:** ChromaDB collection `documents` in `data/chroma/`.
 - **PDF support:** Text extraction, figure cropping/description/validation, and structured table extraction and validation.
-- **Source-aware table references:** Supports both newer numeric references (such as Table 3) and legacy Roman numerals (such as Table II).
+- **Source-aware table references:** Supports numeric references (such as Table 3) and legacy Roman numerals (such as Table II).
 - **Exact table operations:** Certain structured table listings and numerical rankings are handled directly in Python rather than reconstructed by a language model.
-- **Neighboring-chunk retrieval:** Adds nearby text passages when a relevant explanation spans several chunks.
+- **Neighboring-chunk retrieval:** Adds nearby passages when a relevant explanation spans several chunks.
+- **Conversation routing:** LangGraph routes new-topic, follow-up, and earlier-chat recall questions.
+- **Persistent chats and memory:** SQLite-backed conversations, chat switching/deletion, and append-only condensed summary segments alongside original messages.
+- **Evidence viewer and provenance:** Clickable source references and PDF/TXT evidence viewing; separately labels answer type (e.g., hypothetical example or conversation recall) and evidence status. Some sources are explicitly marked unverified.
 - **Interfaces:** Streamlit web app and command-line questions.
-- **Diagnostics:** Regression testing, retrieval evaluation, and optional profiling.
+- **Diagnostics:** Core offline regression tests, legacy fixture/live regression tests, retrieval evaluation, and optional profiling.
 
-Sources can include filenames, pages, table/figure numbers, and chunk references. They are not yet verified claim-level citations.
+Source references may include filenames, pages, table/figure numbers, and chunk references. A matched passage is **not** the same as independently verified claim-level attribution.
 
 ## Architecture
 
-The Local RAG Search Engine combines local document indexing, semantic
-retrieval, LangGraph-based conversation routing, persistent memory,
-and source-aware answer generation.
+The Local RAG Search Engine combines local document indexing, semantic retrieval, LangGraph-based conversation routing, persistent memory, and source-aware answer generation.
 
 ### System overview
 
@@ -39,47 +40,39 @@ The indexing pipeline processes different content types:
 - **PDF figures:** Crop, describe, and validate figures.
 - **PDF tables:** Extract, structure, and validate table content.
 
-The processed content is embedded using `nomic-embed-text` and
-stored in ChromaDB for semantic retrieval.
+The processed content is embedded using `nomic-embed-text` and stored in ChromaDB for semantic retrieval.
 
 ### Question answering and LangGraph routing
 
 ![Question Answering and Routing](docs/images/2.png)
 
-LangGraph routes questions through three paths:
+LangGraph uses three routes:
 
-- **New topic:** Retrieve relevant evidence from indexed documents.
-- **Follow-up:** Use recent conversation context and supporting evidence.
-- **Recall:** Retrieve information from earlier chat discussions.
+- **New topic:** Retrieve evidence from indexed documents.
+- **Follow-up:** Resolve questions using recent conversation context and supporting document evidence when applicable.
+- **Recall:** Recover information from earlier discussion, distinctly labeled as conversation memory rather than independently verified paper evidence.
 
-The query engine also supports source-aware table and figure lookup,
-including some deterministic table-answering operations.
+The query engine also supports source-aware table and figure lookup, including some deterministic table-answering operations. Routing rules are heuristic and have known limitations on ambiguous questions.
 
 ### Citations and evidence verification
 
 ![Citation and Evidence Viewer](docs/images/3.png)
 
-The application provides clickable citations, PDF and TXT evidence
-viewing, table and figure highlighting, and provenance labels that
-distinguish document evidence, conversation recall, and generated examples.
+The application provides clickable references, PDF/TXT evidence viewing and highlighting where feasible, and provenance labels. It distinguishes document-supported responses, conversation recall, reasoned inference, and hypothetical illustrations. If a claim-level match is unavailable, it labels the retrieved source as **unverified**, not as a validated citation.
 
 ### Persistent conversation memory
 
 ![Conversation Memory and Chat Recall](docs/images/4.png)
 
-SQLite stores the original chat messages. Older conversations are
-summarized into append-only memory segments while recent messages
-remain available verbatim.
-
-The recall workflow can use both the saved summaries and original
-conversation history.
+SQLite retains the original messages for each chat. Older conversation sections are condensed into append-only memory segments while recent messages remain available verbatim. The recall workflow can use both summaries and original conversation history. Segment append behavior was tested; perfect long-term recall is not guaranteed.
 
 ## Requirements
 
-- Python and `pip` (development used Python 3.14; other versions have not been comprehensively tested).
-- [Ollama](https://ollama.com/) installed and running.
-- Sufficient system memory for the selected models.
-- Internet connectivity for initial downloads and webpage indexing.
+- Python and `pip` (development tested on Windows with Python 3.14; other versions and operating systems have not been comprehensively tested).
+- [Ollama](https://ollama.com/) installed and running locally.
+- Sufficient RAM and disk space for the chosen models and indexed documents.
+- Internet connectivity for initial packages/models and optional webpage indexing.
+- Python dependencies from `requirements.txt`, including **LangGraph** (required for the Streamlit question-answering path).
 
 Pull the configured models:
 
@@ -89,7 +82,7 @@ ollama pull qwen3:8b
 ollama pull qwen3-vl:8b
 ```
 
-Image and PDF-figure processing can be substantially more resource-intensive than text retrieval.
+The vision model is needed for image/figure descriptions; text-only querying primarily uses the embedding and answer models. Image and figure processing can use substantially more resources.
 
 ## Installation
 
@@ -116,7 +109,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Start Ollama before using the application. The default setup assumes Ollama is available locally.
+Start Ollama before using the application. The default setup assumes Ollama is available locally at `http://127.0.0.1:11434`. The macOS/Linux commands describe a development installation, **not** a verified platform-specific installer.
 
 ### Model configuration
 
@@ -183,17 +176,19 @@ Place `example.pdf` in `data/documents/` or supply a valid path. Extraction and 
 
 ## Web interface
 
-Start Streamlit:
+Start Streamlit from the project root:
 
 ```powershell
 python -m streamlit run src/web_app.py
 ```
 
-Open **http://localhost:8501** if the browser does not open automatically. The UI supports uploads, URL entry, indexing, questions, expandable retrieved sources, and clearing session chat history.
+Open **http://localhost:8501** if the browser does not open automatically. The Streamlit interface supports document/image uploads, URL entry, indexing, questions, **persistent SQLite-backed chats**, switching between chats, clearing/deleting saved chats, clickable citations, source previews, and a conversation-memory diagnostics panel. Questions run through the LangGraph router; conversation history and summaries are kept separately for each chat.
 
-On Windows, double-click `START_APP.vbs` to launch without a visible terminal (requires `.venv`). Use `STOP_APP.vbs` to request shutdown.
+On **Windows**, double-click `START_APP.vbs` to launch without a visible terminal (requires `.venv`), and use `STOP_APP.vbs` to request shutdown.
 
-The web interface is intended for **trusted local use**, not exposure directly to the public internet.
+On **macOS**, the repository includes `START_APP.command` and `STOP_APP.command`. After setting executable permissions (`chmod +x START_APP.command STOP_APP.command`) and preparing `.venv`, these launch/stop the Streamlit service. These macOS launchers are development conveniences, not signed applications. On Linux, run Streamlit from the terminal using the command above.
+
+The web interface is intended for **trusted local use**, not exposure directly to the public internet. Conversations are saved locally and persist after closing the browser until deleted.
 
 ## Command-line questions
 
@@ -209,17 +204,28 @@ According to Table II of the OWASP vulnerability dataset paper, list all OWASP c
 What does Figure 3 in agentchaos.pdf show?
 ```
 
-When sufficient evidence exists, the output includes an answer and source references. For some exact structured table requests, Python produces the answer without an LLM call.
+When sufficient evidence exists, the output includes an answer and source references. For some exact structured table requests, Python produces the answer without an LLM call. **The direct CLI entry point is primarily single-question retrieval**; persistent multi-turn conversations are provided by the Streamlit UI.
 
 ## Evaluation and diagnostics
 
-Run the regression tests:
+### Core regression tests (offline)
 
 ```powershell
+python .\src\test_rag_core_regression.py
+```
+
+The core suite tests LangGraph dispatch with a fake backend, cumulative memory behavior, provenance classification, and example-request recognition. It does not require running Ollama or Streamlit, and does not write to ChromaDB or SQLite. **At the November 2026 Windows checkpoint, all 10 tests passed.** These mocked tests do not establish end-to-end retrieval or answer correctness.
+
+### PDF/table fixture regression and live tests
+
+```powershell
+python .\src\test_rag_regression.py
 python .\src\test_rag_regression.py --live
 ```
 
-At the October 2026 development checkpoint, **3 offline tests and 4 live tests passed** using the development machine's existing indexed corpus. Live tests depend on local indexed documents and models; this is not a general benchmark of RAG accuracy.
+These older tests rely on local extracted-table fixtures; `--live` additionally requires an existing indexed development corpus and running Ollama. At the October 2026 development checkpoint, **3 fixture tests and 4 live tests passed**. These results are historical and are not a general RAG benchmark. A fresh clone does not contain the local fixtures or corpus needed by that suite.
+
+### Retrieval evaluation and profiling
 
 Evaluate evidence retrieval:
 
@@ -240,28 +246,31 @@ python .\src\query_documents.py
 
 Ollama inference and ChromaDB indexing/storage operate locally by default. Downloading packages/models and indexing webpages require external network access. Only retrieve and index content you are authorized to process.
 
-Local documents, images, ChromaDB records, extracted figures/tables, and generated reports are excluded from Git using `.gitignore`. **Cloning this repository does not download the development corpus or its database.**
+Local documents, images, ChromaDB records, extracted figures/tables, generated reports, **SQLite chats (`data/chat_history.sqlite3`)**, and local evaluation data are excluded from Git using `.gitignore`. **Cloning this repository does not download the development corpus, database, or saved conversations.** Review any documents and logs before deliberately sharing them.
 
 ## Known limitations
 
 - PDF layouts, figures, tables, and vision-generated descriptions may be incomplete or inaccurate.
 - Structural validation does not certify every extracted cell against the original PDF.
 - Chunking is simple; neighboring-chunk expansion reduces but does not eliminate missing-context problems.
-- Grounded answers can still be incomplete or incorrect; source listings are not verified per claim.
+- Grounded answers can still be incomplete or incorrect; matched sources are not guaranteed claim-level verification.
+- Some citation links can only open unverified source previews when exact text or regions cannot be matched.
 - Ambiguous table references across documents may require a clearer source name.
 - Existing ChromaDB records are not automatically updated when source files change or are removed.
+- LangGraph routing uses heuristics and may misclassify ambiguous questions or context-dependent requests.
+- Chat memory uses recent messages, append-only summaries, and retained original messages. Summaries and recall can omit or misinterpret details; the memory length is bounded.
 - Local model inference may be slow on CPU-only machines.
-- Chat messages are displayed within the Streamlit session but are not used as conversational retrieval context.
+- Install and launcher behavior have not been comprehensively verified across Windows, macOS, and Linux; there is no packaged installer yet.
 
 ## Roadmap
 
-- Claim-level citation/evidence attribution.
+- Stronger claim-level citation verification, answer grounding, and uncertainty calibration.
 - Safer refresh and deletion of outdated indexed records.
 - More figure/table regression coverage and multi-document retrieval tests.
-- Stronger evaluations of factual answer quality.
+- Stronger evaluations of factual answer quality and long-conversation recall.
 - Improved layout extraction and ambiguity handling.
+- Beta desktop packaging for Windows, macOS, and Linux after dependency and installation testing.
 
 ## Project status
 
-**Functional research prototype:** CLI and Streamlit access, local multimodal indexing, structured PDF retrieval, and automated regression tests.
-
+**Functional research prototype:** CLI and Streamlit access, local multimodal indexing, structured PDF retrieval, persistent conversations, LangGraph routing, cumulative memory, source evidence viewing, and automated regression tests. The application is still run as a local Streamlit service; installable desktop distributions are future work.
