@@ -18,10 +18,13 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+from app_paths import DOCUMENTS_DIR, TABLE_TESTS_DIR, DB_PATH
+
 ROOT = Path(__file__).resolve().parent.parent
-DOCS_DIR = ROOT / "data" / "documents"
-TEST_DIR = ROOT / "data" / "table_tests"
-DB_DIR = ROOT / "data" / "chroma"
+
+DOCS_DIR = DOCUMENTS_DIR
+TEST_DIR = TABLE_TESTS_DIR
+DB_DIR = DB_PATH
 
 
 def locate_pdf(argument):

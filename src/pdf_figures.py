@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pymupdf
 
+from app_paths import DOCUMENTS_DIR, FIGURES_DIR
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOCUMENTS_DIR = PROJECT_ROOT / 'data' / 'documents'
-FIGURES_DIR = PROJECT_ROOT / 'data' / 'figures'
 RENDER_SCALE = 2
 MAX_SEARCH_HEIGHT = 360
 TOP_PADDING = 2

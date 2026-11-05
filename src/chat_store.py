@@ -4,7 +4,9 @@ import sqlite3
 import uuid
 from pathlib import Path
 
-DEFAULT_DB = Path(__file__).resolve().parent.parent / 'data' / 'chat_history.sqlite3'
+from app_paths import CHAT_DB_PATH
+
+DEFAULT_DB = CHAT_DB_PATH
 
 
 def _connect(db_path=None):

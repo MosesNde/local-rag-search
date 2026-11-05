@@ -20,17 +20,10 @@ from pdf_figure_context import find_figure_context
 # Configuration
 # --------------------------------------------------
 
+from app_paths import DOCUMENTS_DIR, FIGURES_DIR, FIGURE_TESTS_DIR
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-DOCUMENTS_DIR = PROJECT_ROOT / "data" / "documents"
-FIGURES_DIR = PROJECT_ROOT / "data" / "figures"
-
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "figure_tests"
-    / "validation"
-)
+OUTPUT_DIR = FIGURE_TESTS_DIR / "validation"
 
 NUM_CTX = VISION_CONTEXT_SIZE
 NUM_PREDICT = 2048

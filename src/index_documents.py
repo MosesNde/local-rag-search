@@ -1,5 +1,6 @@
 
 import hashlib
+import json
 import os
 import re
 import sys
@@ -16,12 +17,15 @@ from bs4 import BeautifulSoup
 # Configuration
 # --------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DOCUMENTS_DIR = PROJECT_ROOT / "data" / "documents"
-IMAGES_DIR = PROJECT_ROOT / "data" / "images"
-DB_PATH = PROJECT_ROOT / "data" / "chroma"
-URLS_FILE = PROJECT_ROOT / "data" / "urls.txt"
+from app_paths import (
+    DOCUMENTS_DIR,
+    IMAGES_DIR,
+    DB_PATH,
+    URLS_FILE,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 CHUNK_SIZE = 200
 OVERLAP = 1
@@ -30,6 +34,104 @@ BATCH_SIZE = 16
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp"
 }
+
+
+# --------------------------------------------------
+# Incremental PDF stage tracking
+# --------------------------------------------------
+# Stored with the user's persistent app data, never in the bundled source.
+# This tracks successfully executed figure/table passes, independently of
+# whether the text was already indexed. Older PDFs get one initial pass.
+PDF_STATE_FILE = DOCUMENTS_DIR.parent / "pdf_index_stage_state.json"
+PDF_STATE_VERSION = 1
+
+# Normal indexing stays fast: PDF text is still indexed, but the optional
+# vision-heavy figure and table stages are explicitly enabled when needed.
+# To process figures: $env:RAG_PROCESS_PDF_FIGURES = "1"
+# To process tables:  $env:RAG_PROCESS_PDF_TABLES = "1"
+def env_enabled(name, default="0"):
+    return os.getenv(name, default).strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+PROCESS_PDF_FIGURES = env_enabled("RAG_PROCESS_PDF_FIGURES")
+PROCESS_PDF_TABLES = env_enabled("RAG_PROCESS_PDF_TABLES")
+RETRY_PDF_STAGES = os.getenv("RAG_RETRY_PDF_STAGES", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+
+def pdf_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_pdf_stage_state():
+    if not PDF_STATE_FILE.exists():
+        return {"version": PDF_STATE_VERSION, "pdfs": {}}
+    try:
+        data = json.loads(PDF_STATE_FILE.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict)
+                or data.get("version") != PDF_STATE_VERSION
+                or not isinstance(data.get("pdfs"), dict)):
+            raise ValueError("Unexpected PDF state format or version")
+        return data
+    except (OSError, ValueError) as exc:
+        # Fail safely. Do not overwrite an unreadable state or assume that
+        # past processing is complete; preserve the existing database.
+        raise RuntimeError(
+            f"Could not read PDF stage state {PDF_STATE_FILE}: {exc}"
+        ) from exc
+
+
+def save_pdf_stage_state(state):
+    PDF_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = PDF_STATE_FILE.with_name(
+        f"{PDF_STATE_FILE.name}.{os.getpid()}.tmp"
+    )
+    try:
+        temp.write_text(
+            json.dumps(state, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temp, PDF_STATE_FILE)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def mark_pdf_stage_complete(state, pdf_path, digest, stage):
+    record = state["pdfs"].setdefault(
+        pdf_path.name, {"sha256": digest, "stages": {}}
+    )
+    record["stages"][stage] = True
+    save_pdf_stage_state(state)
+
+
+def pdf_stage_done(state, pdf_path, stage):
+    record = state["pdfs"].get(pdf_path.name, {})
+    return bool(record.get("stages", {}).get(stage))
+
+
+def assert_pdf_not_replaced(state, pdf_path, digest, collection):
+    record = state["pdfs"].get(pdf_path.name)
+    if record and record.get("sha256") != digest:
+        raise RuntimeError(
+            f"PDF {pdf_path.name!r} has changed since its last processing pass. "
+            "Existing ChromaDB records use the filename as their source key. "
+            "To preserve them safely, add the revised PDF with a NEW filename "
+            "instead of overwriting the existing document."
+        )
+    # On first migration, the current database has no content hashes. This
+    # initializes tracking only; it does not claim previous stages completed.
+    if not record:
+        state["pdfs"][pdf_path.name] = {
+            "sha256": digest, "stages": {}
+        }
+        save_pdf_stage_state(state)
 
 
 # --------------------------------------------------
@@ -312,6 +414,8 @@ def main():
     all_ids = []
 
     pdf_paths = []
+    pdf_hashes = {}
+    pdf_stage_state = load_pdf_stage_state()
 
     # --------------------------------------------------
     # 1. TXT and PDF text
@@ -339,6 +443,11 @@ def main():
         suffix = document_path.suffix.lower()
 
         if suffix == ".pdf":
+            digest = pdf_sha256(document_path)
+            assert_pdf_not_replaced(
+                pdf_stage_state, document_path, digest, collection
+            )
+            pdf_hashes[document_path.name] = digest
             pdf_paths.append(document_path)
             file_type = "pdf"
         else:
@@ -650,12 +759,27 @@ def main():
 
     figure_failures = []
 
-    if pdf_paths:
+    if not PROCESS_PDF_FIGURES:
+        print("Skipping PDF figure analysis (optional; set RAG_PROCESS_PDF_FIGURES=1 to enable).")
+    elif pdf_paths:
         from pdf_pipeline import index_figures
 
         for pdf_path in pdf_paths:
+            if (not RETRY_PDF_STAGES
+                    and pdf_stage_done(pdf_stage_state, pdf_path, "figures")):
+                print(f"Skipping completed figure stage: {pdf_path.name}")
+                continue
             try:
+                print(f"Checking figures: {pdf_path.name}")
                 index_figures(pdf_path)
+                # Successful execution, including PDFs with no detected figures.
+                # The pipeline can reject individual figures as non-provisional;
+                # force a later recheck with RAG_RETRY_PDF_STAGES=1 if needed.
+                mark_pdf_stage_complete(
+                    pdf_stage_state, pdf_path,
+                    pdf_hashes[pdf_path.name], "figures"
+                )
+                print(f"Figure pass complete: {pdf_path.name}")
 
             except Exception as error:
                 figure_failures.append(
@@ -692,13 +816,16 @@ def main():
         "0", "false", "no", "off"
     )
     print(f"Table indexing dry run: {table_dry_run}")
+    print(f"Force PDF stages: {RETRY_PDF_STAGES}")
 
     table_failures = []
     table_prepared = 0
     table_added = 0
     table_skipped = 0
 
-    if pdf_paths:
+    if not PROCESS_PDF_TABLES:
+        print("Skipping PDF table analysis (optional; set RAG_PROCESS_PDF_TABLES=1 to enable).")
+    elif pdf_paths:
         try:
             from pdf_table_pipeline import index_tables
         except Exception as error:
@@ -706,7 +833,13 @@ def main():
             print(f"Table pipeline could not be imported: {error}")
         else:
             for pdf_path in pdf_paths:
+                stage = "tables_dry_run" if table_dry_run else "tables_indexed"
+                if (not RETRY_PDF_STAGES
+                        and pdf_stage_done(pdf_stage_state, pdf_path, stage)):
+                    print(f"Skipping completed table stage ({stage}): {pdf_path.name}")
+                    continue
                 try:
+                    print(f"Checking tables: {pdf_path.name}")
                     table_result = index_tables(
                         pdf_path,
                         dry_run=table_dry_run,
@@ -719,6 +852,11 @@ def main():
                         f"prepared={table_result.get('prepared_records', 0)}, "
                         f"added={table_result.get('new_records', 0)}, "
                         f"already indexed={table_result.get('already_indexed', 0)}"
+                    )
+                    # A dry run never qualifies as actual table indexing.
+                    mark_pdf_stage_complete(
+                        pdf_stage_state, pdf_path,
+                        pdf_hashes[pdf_path.name], stage
                     )
                 except Exception as error:
                     table_failures.append((pdf_path.name, str(error)))
@@ -762,6 +900,7 @@ def main():
     print(f"Table records added: {table_added}")
     print(f"Table records already indexed: {table_skipped}")
     print(f"Table pipeline failures: {len(table_failures)}")
+    print(f"PDF stage state: {PDF_STATE_FILE}")
 
     if table_failures:
         for name, error in table_failures:

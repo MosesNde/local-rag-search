@@ -50,3 +50,25 @@ data/chat_history.sqlite3
 
 # Local evaluation datasets and generated results
 data/evaluation/
+
+# Managed source installation environments
+.venv-lucy/
+.venv312/
+
+# Generated desktop packaging outputs
+/build/
+/dist/
+/installer/
+
+# Local backups
+*.backup
+*.packaging-backup
+
+# Python test and packaging caches
+.pytest_cache/
+*.egg-info/
+
+# Local PDF indexing state
+data/pdf_index_stage_state.json
+
+.venv-lucy-314/

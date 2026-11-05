@@ -7,11 +7,10 @@ from pathlib import Path
 import pymupdf
 
 
+from app_paths import DOCUMENTS_DIR, FIGURE_TESTS_DIR
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOCUMENTS_DIR = PROJECT_ROOT / "data" / "documents"
-OUTPUT_DIR = (
-    PROJECT_ROOT / "data" / "figure_tests" / "context"
-)
+OUTPUT_DIR = FIGURE_TESTS_DIR / "context"
 
 MAX_CONTEXT_CHARS = 9000
 

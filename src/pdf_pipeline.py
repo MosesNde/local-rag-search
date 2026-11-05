@@ -13,15 +13,10 @@ from pdf_figures import extract_pdf_figures
 from pdf_validation import run_validation
 
 
+from app_paths import DOCUMENTS_DIR, DB_PATH, FIGURE_TESTS_DIR
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOCUMENTS_DIR = PROJECT_ROOT / "data" / "documents"
-DB_PATH = PROJECT_ROOT / "data" / "chroma"
-VALIDATION_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "figure_tests"
-    / "validation"
-)
+VALIDATION_DIR = FIGURE_TESTS_DIR / "validation"
 
 
 def figure_id(source, page, number):

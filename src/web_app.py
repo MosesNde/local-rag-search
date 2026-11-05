@@ -6,6 +6,9 @@ from difflib import SequenceMatcher
 import subprocess
 import os
 import sys
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,11 +18,15 @@ import streamlit as st
 from chat_store import (create_chat, list_chats, chat_exists, read_messages,
                         add_message, delete_chat, get_chat_summary, save_chat_summary)
 
+
+from app_paths import (
+    DOCUMENTS_DIR,
+    IMAGES_DIR,
+    DB_PATH,
+    URLS_FILE,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
-DOCUMENTS_DIR = ROOT / 'data' / 'documents'
-IMAGES_DIR = ROOT / 'data' / 'images'
-DB_PATH = ROOT / 'data' / 'chroma'
-URLS_FILE = ROOT / 'data' / 'urls.txt'
 INDEX_SCRIPT = ROOT / 'src' / 'index_documents.py'
 QUERY_SCRIPT = ROOT / 'src' / 'langgraph_rag.py'
 DOCUMENT_TYPES = {'.txt', '.pdf'}
@@ -69,10 +76,161 @@ def save_website_url(url):
     return True
 
 
-def run_indexer():
-    return subprocess.run([sys.executable, str(INDEX_SCRIPT)], cwd=str(ROOT),
-                          capture_output=True, text=True, encoding='utf-8',
-                          errors='replace', timeout=1800)
+def worker_command(mode):
+    """Select the appropriate worker command for development or packaging."""
+    if getattr(sys, "frozen", False):
+        # In a PyInstaller bundle, sys.executable is LocalRAG.exe.
+        return [sys.executable, mode]
+
+    # Preserve the existing development workflow.
+    script = QUERY_SCRIPT if mode == "query" else INDEX_SCRIPT
+
+    if mode == "query":
+        return [sys.executable, str(script), "--conversation-json"]
+
+    if mode == "index":
+        return [sys.executable, str(script)]
+
+    raise ValueError(f"Unsupported worker mode: {mode}")
+
+
+# One indexing job per Streamlit server, shared across browser sessions.
+# This is intentionally not stored in st.session_state (which is per session).
+INDEXING_LOG_DIR = DB_PATH.parent / 'logs'
+INDEXING_LOG_DIR.mkdir(parents=True, exist_ok=True)
+INDEXING_PROGRESS_FILE = INDEXING_LOG_DIR / 'indexing-progress.log'
+
+
+class IndexingJob:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.process = None
+        self.started_at = None
+        self.completed_at = None
+        self.returncode = None
+        self.start_error = None
+
+    def running(self):
+        with self.lock:
+            return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return False
+            self.process = None
+            self.returncode = None
+            self.start_error = None
+            self.completed_at = None
+            self.started_at = time.time()
+            INDEXING_PROGRESS_FILE.write_text('', encoding='utf-8')
+            env = {**os.environ,
+                   'PYTHONUNBUFFERED': '1',
+                   'PYTHONIOENCODING': 'utf-8',
+                   'LOCALRAG_INDEX_PROGRESS_FILE': str(INDEXING_PROGRESS_FILE)}
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            try:
+                # In development, stdout writes directly to the progress file.
+                # The frozen GUI launcher also explicitly redirects Python's
+                # sys.stdout to this file (windowed PyInstaller sets it to None).
+                with INDEXING_PROGRESS_FILE.open('a', encoding='utf-8') as log:
+                    self.process = subprocess.Popen(
+                        worker_command('index'), cwd=str(ROOT),
+                        stdout=log, stderr=subprocess.STDOUT,
+                        env=env, creationflags=flags)
+            except Exception as exc:
+                self.start_error = str(exc)
+                raise
+            return True
+
+    def snapshot(self):
+        with self.lock:
+            proc = self.process
+            if proc is None:
+                state = 'idle'
+                code = None
+            else:
+                code = proc.poll()
+                if code is None:
+                    state = 'running'
+                else:
+                    state = 'success' if code == 0 else 'failed'
+                    self.returncode = code
+                    if self.completed_at is None:
+                        self.completed_at = time.time()
+            started = self.started_at
+        try:
+            # Bounded read; avoid rendering enormous logs in Streamlit.
+            with INDEXING_PROGRESS_FILE.open('rb') as file:
+                file.seek(0, os.SEEK_END)
+                size = file.tell()
+                file.seek(max(0, size - 100_000))
+                output = file.read().decode('utf-8', errors='replace')
+        except FileNotFoundError:
+            output = ''
+        return state, code, started, output
+
+
+@st.cache_resource(show_spinner=False)
+def indexing_job():
+    return IndexingJob()
+
+
+def indexing_stage(output):
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith('Analysis attempt'):
+            return 'Analyzing a PDF figure with the vision model: ' + line
+        if line.startswith('Validating new figures:'):
+            return line
+        if line.startswith('Processing PDF:'):
+            return 'Processing PDF figures: ' + line.removeprefix('Processing PDF:').strip()
+        if line.startswith('Processing image:'):
+            return line
+        if line.startswith('Processing:'):
+            return 'Processing document: ' + line.removeprefix('Processing:').strip()
+        if line.startswith('Processing URL:'):
+            return line
+        if line.startswith('Indexed ') and '/' in line:
+            return 'Generating and storing embeddings: ' + line
+        if line.startswith('AUTOMATIC PDF TABLE PROCESSING'):
+            return 'Processing PDF tables'
+        if line.startswith('AUTOMATIC PDF FIGURE PROCESSING'):
+            return 'Processing PDF figures'
+        if line.startswith('INDEXING SUMMARY'):
+            return 'Preparing indexing summary'
+        if line.startswith('Table result for'):
+            return line
+    return 'Starting document indexing...'
+
+
+@st.fragment(run_every='2s')
+def show_indexing_progress():
+    state, returncode, started, output = indexing_job().snapshot()
+    if state == 'idle':
+        return
+    if state == 'running':
+        st.info('Indexing is running. You can continue using the application, '
+                'but avoid starting another indexing operation.')
+        st.write('**Current stage:** ' + indexing_stage(output))
+        if started:
+            elapsed = int(time.time() - started)
+            st.caption(f'Elapsed: {elapsed // 60} min {elapsed % 60} sec. '
+                       'PDF vision analysis may take several minutes per figure.')
+            if elapsed > 1800:
+                st.warning('Indexing has exceeded 30 minutes. Check the progress '
+                           'details; this job will not be terminated automatically.')
+    elif state == 'success':
+        st.success('Indexing completed successfully!')
+        try:
+            st.metric('Total indexed records', get_record_count())
+        except Exception as exc:
+            st.warning(f'Could not refresh record count: {exc}')
+    else:
+        st.error(f'Indexing finished with an error (exit code {returncode}). '
+                 'Previously indexed records have not been intentionally cleared.')
+    with st.expander('Indexing progress and details', expanded=state == 'running'):
+        st.code(output[-20000:] or '(No progress messages yet.)', language='text')
 
 
 def run_query(question, history, chat_id):
@@ -93,7 +251,7 @@ def run_query(question, history, chat_id):
         {'role': m.get('role'), 'content': m.get('content', '')}
         for m in history if m.get('role') in ('user', 'assistant')
     ]
-    return subprocess.run([sys.executable, str(QUERY_SCRIPT), '--conversation-json'],
+    return subprocess.run(worker_command("query"),
                           input=json.dumps(payload, ensure_ascii=False), cwd=str(ROOT),
                           capture_output=True, text=True, encoding='utf-8',
                           errors='replace', timeout=600,
@@ -461,7 +619,7 @@ def highlight_pdf_chunk(page, chunk_text):
 @st.cache_data(show_spinner=False, max_entries=8)
 def pdf_page_png(name, page, modified_ns, table_label=None, row_number=None, chunk_text=None, figure_number=None):
     """Render the cited page; retain verified PDF table-row highlighting."""
-    import fitz
+    import pymupdf as fitz
     path = local_pdf(name)
     if path is None:
         raise FileNotFoundError(name)
@@ -532,7 +690,7 @@ def mark_pdf_figure(page, figure_number):
     For layouts where the diagram extent is uncertain, highlight ONLY the
     exact caption. This avoids outlining surrounding paragraphs as evidence.
     """
-    import fitz
+    import pymupdf as fitz
     caption_re = re.compile(r'^\s*(?:Figure|Fig\.)\s*' + re.escape(str(figure_number)) + r'\s*[:.\-]', re.I)
     captions = []
     for block in page.get_text('blocks'):
@@ -844,7 +1002,7 @@ def render_assistant(answer, sources, message_id, answer_number, user_question='
     display_sources(sources)
 
 
-st.set_page_config(page_title='Local RAG Search', page_icon='🔎', layout='wide')
+st.set_page_config(page_title='LUCY', page_icon='🔎', layout='wide')
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'selected_evidence' not in st.session_state:
@@ -931,7 +1089,8 @@ with st.sidebar:
     uploaded_files = st.file_uploader('Upload documents or images',
         type=['txt', 'pdf', 'png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
     website_url = st.text_input('Webpage URL', placeholder='https://example.com/article')
-    index_clicked = st.button('Index content', type='primary', use_container_width=True)
+    index_clicked = st.button('Index content', type='primary', use_container_width=True,
+                              disabled=indexing_job().running())
     st.divider()
     if st.button('Clear chat', use_container_width=True):
         # Clear only the current conversation; keep all other saved chats.
@@ -952,7 +1111,10 @@ with st.sidebar:
     st.caption('Powered by Ollama + ChromaDB')
 
 if index_clicked:
-    if not uploaded_files and not website_url.strip():
+    job = indexing_job()
+    if job.running():
+        st.warning('Indexing is already running. Please wait for it to finish.')
+    elif not uploaded_files and not website_url.strip():
         st.warning('Upload a file or enter a webpage URL.')
     else:
         try:
@@ -970,23 +1132,18 @@ if index_clicked:
                 st.success('Webpage URL added.')
             elif added is False:
                 st.info('Webpage URL already exists.')
-            with st.spinner('Indexing knowledge sources...'):
-                result = run_indexer()
-            if result.returncode == 0:
-                st.success('Indexing completed successfully!')
-                st.metric('Total indexed records', get_record_count())
-                with st.expander('Indexing details'):
-                    st.code(result.stdout, language='text')
-            else:
-                st.error('Indexing failed.')
-                with st.expander('Error details', expanded=True):
-                    st.code(result.stdout + '\n' + result.stderr, language='text')
-        except subprocess.TimeoutExpired:
-            st.error('Indexing exceeded the time limit.')
+            # A global guard prevents multiple sessions from launching
+            # concurrent indexing workers against the same ChromaDB collection.
+            if not job.start():
+                st.warning('Another indexing job is already running.')
         except Exception as exc:
-            st.error(f'Indexing error: {exc}')
+            st.error(f'Could not start indexing: {exc}')
 
-st.title('🔎 Local RAG Search')
+# Unlike subprocess.run(), this updates while the worker is processing.
+show_indexing_progress()
+
+st.title('🔎 LUCY')
+st.caption('Local Understanding and Contextual sYnthesis')
 st.caption('Chat with your documents using locally running AI.')
 
 # Important: consume a newly submitted question BEFORE creating the layout.

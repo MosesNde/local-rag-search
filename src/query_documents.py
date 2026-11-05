@@ -16,8 +16,9 @@ except ImportError:
     EMBEDDING_MODEL = "nomic-embed-text"
     ANSWER_MODEL = "qwen3:8b"
 
+from app_paths import DB_PATH
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "chroma"
 DISTANCE_THRESHOLD = 1.0
 N_RESULTS = 10  # maximum semantic candidates when expansion is needed
 INITIAL_SEMANTIC_RESULTS = 3
