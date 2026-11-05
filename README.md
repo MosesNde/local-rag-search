@@ -9,16 +9,27 @@ Index local TXT/PDF documents, images, and webpages, then ask questions using a 
 ## Features
 
 - **Inputs:** TXT, PDF, PNG, JPG/JPEG, WebP, and webpages.
+
 - **Local models:** `nomic-embed-text` embeddings, `qwen3:8b` answers, and `qwen3-vl:8b` image descriptions (configurable).
+
 - **Persistent knowledge base:** ChromaDB collection `documents` in `data/chroma/`.
+
 - **PDF support:** Text extraction, figure cropping/description/validation, and structured table extraction and validation.
+
 - **Source-aware table references:** Supports numeric references (such as Table 3) and legacy Roman numerals (such as Table II).
+
 - **Exact table operations:** Certain structured table listings and numerical rankings are handled directly in Python rather than reconstructed by a language model.
+
 - **Neighboring-chunk retrieval:** Adds nearby passages when a relevant explanation spans several chunks.
+
 - **Conversation routing:** LangGraph routes new-topic, follow-up, and earlier-chat recall questions.
+
 - **Persistent chats and memory:** SQLite-backed conversations, chat switching/deletion, and append-only condensed summary segments alongside original messages.
+
 - **Evidence viewer and provenance:** Clickable source references and PDF/TXT evidence viewing; separately labels answer type (e.g., hypothetical example or conversation recall) and evidence status. Some sources are explicitly marked unverified.
+
 - **Interfaces:** Streamlit web app and command-line questions.
+
 - **Diagnostics:** Core offline regression tests, legacy fixture/live regression tests, retrieval evaluation, and optional profiling.
 
 Source references may include filenames, pages, table/figure numbers, and chunk references. A matched passage is **not** the same as independently verified claim-level attribution.
@@ -36,8 +47,11 @@ The Local RAG Search Engine combines local document indexing, semantic retrieval
 The indexing pipeline processes different content types:
 
 - **TXT, PDF, and webpages:** Extract and chunk text.
+
 - **Images:** Generate searchable descriptions using a vision model.
+
 - **PDF figures:** Crop, describe, and validate figures.
+
 - **PDF tables:** Extract, structure, and validate table content.
 
 The processed content is embedded using `nomic-embed-text` and stored in ChromaDB for semantic retrieval.
@@ -49,7 +63,9 @@ The processed content is embedded using `nomic-embed-text` and stored in ChromaD
 LangGraph uses three routes:
 
 - **New topic:** Retrieve evidence from indexed documents.
+
 - **Follow-up:** Resolve questions using recent conversation context and supporting document evidence when applicable.
+
 - **Recall:** Recover information from earlier discussion, distinctly labeled as conversation memory rather than independently verified paper evidence.
 
 The query engine also supports source-aware table and figure lookup, including some deterministic table-answering operations. Routing rules are heuristic and have known limitations on ambiguous questions.
@@ -68,48 +84,60 @@ SQLite retains the original messages for each chat. Older conversation sections 
 
 ## Requirements
 
-- Python and `pip` (development tested on Windows with Python 3.14; other versions and operating systems have not been comprehensively tested).
-- [Ollama](https://ollama.com/) installed and running locally.
-- Sufficient RAM and disk space for the chosen models and indexed documents.
-- Internet connectivity for initial packages/models and optional webpage indexing.
-- Python dependencies from `requirements.txt`, including **LangGraph** (required for the Streamlit question-answering path).
+The automated setup scripts install the Python environment, Python dependencies, and Ollama if needed. You do **not** have to install these manually before running the setup script, except where the script prompts for a system prerequisite or permission.
 
-Pull the configured models:
+- Windows 10/11 with PowerShell and `winget` available (tested on Windows 11 using Python 3.14).
+- macOS (tested on Apple Silicon using Python 3.12; Homebrew may be installed with your approval).
+- Ubuntu 24.04 LTS for the Linux script (x86-64 or ARM64; not yet tested).
+- Sufficient memory and disk space for the language models, document index, and installation files.
+- Internet access during first-time installation and for optional webpage indexing.
 
-```powershell
-ollama pull nomic-embed-text
-ollama pull qwen3:8b
-ollama pull qwen3-vl:8b
-```
-
-The vision model is needed for image/figure descriptions; text-only querying primarily uses the embedding and answer models. Image and figure processing can use substantially more resources.
+The default models are `nomic-embed-text` for embeddings, `qwen3:8b` for responses, and `qwen3-vl:8b` for image and figure descriptions. Setup downloads the required models automatically. Vision processing requires additional resources, while text-only querying primarily uses the embedding and answer models.
 
 ## Installation
 
-Clone the repository:
+Clone the repository in PowerShell (Windows) or Terminal (macOS/Linux):
 
-```powershell
+```bash
 git clone https://github.com/MosesNde/local-rag-search.git
 cd local-rag-search
 ```
 
-On **Windows PowerShell**:
+Run the setup script for your operating system **once**.
+
+**Windows (tested):**
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1
 ```
 
-On **macOS or Linux**:
+**macOS — Apple Silicon (tested):**
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+bash setup-macos.sh
 ```
 
-Start Ollama before using the application. The default setup assumes Ollama is available locally at `http://127.0.0.1:11434`. The macOS/Linux commands describe a development installation, **not** a verified platform-specific installer.
+**Ubuntu 24.04 LTS (not yet tested):**
+
+```bash
+bash setup-linux.sh
+```
+
+Setup creates an isolated Python environment, installs `requirements.txt`, starts Ollama, checks or downloads the AI models, and launches LUCY. It may require OS administrator approval. Models can require several gigabytes of downloads. Setup does not delete existing document indexes or conversation history.
+
+See [SETUP_README.md](SETUP_README.md) for detailed setup information.
+
+### Starting LUCY after installation
+
+**You do not need to reinstall LUCY when you close it.** Use the launcher supplied for your operating system:
+
+| Operating system | Start LUCY again | Notes |
+| --- | --- | --- |
+| Windows | Double-click `START_APP.vbs` | Tested with the new setup environment; launches without a visible terminal. |
+| macOS | Double-click `START_APP.command` | May first require `chmod +x START_APP.command` in Terminal; launcher not yet tested. |
+| Ubuntu Linux | Run `bash CREATE_LINUX_SHORTCUT.sh` once, then open the created desktop shortcut | Shortcut creation and startup not yet tested. |
+
+The launchers reuse the installed Python environment and Ollama models; they do **not** reinstall packages or download models. Open <http://localhost:8501> to access LUCY. If the app server is still running after you close the browser tab, you can simply reopen that address. To fully stop LUCY, stop its running Streamlit process; on Windows you can also use `STOP_APP.vbs` to request shutdown.
 
 ### Model configuration
 
@@ -135,12 +163,14 @@ Start Ollama before using the application. The default setup assumes Ollama is a
 Example `data/urls.txt`:
 
 ```text
+
 https://docs.python.org/3/tutorial/introduction.html
 ```
 
 Run the main indexer from the project root:
 
 ```powershell
+
 python .\src\index_documents.py
 ```
 
@@ -151,24 +181,29 @@ The indexer creates local data directories and stores records in the persistent 
 The codebase includes dedicated modules:
 
 - **Figures:** `src/pdf_figures.py`, `src/pdf_pipeline.py`, and `src/pdf_validation.py` detect/crop, describe, and validate PDF figures.
+
 - **Tables:** `src/pdf_tables.py`, `src/pdf_table_pipeline.py`, and `src/pdf_table_validation.py` extract and validate structured records.
+
 - **Legacy/specialized scripts:** `src/index_pdf_figures.py` and `src/index_pdf_tables.py` were developed for earlier indexing workflows; use the integrated pipeline for ordinary indexing.
 
 For an individual PDF figure-processing run:
 
 ```powershell
+
 python .\src\pdf_pipeline.py --pdf example.pdf
 ```
 
 For table extraction/validation **without ChromaDB writes**:
 
 ```powershell
+
 python .\src\pdf_table_pipeline.py example.pdf
 ```
 
 For explicit table indexing:
 
 ```powershell
+
 python .\src\pdf_table_pipeline.py example.pdf --index
 ```
 
@@ -176,29 +211,39 @@ Place `example.pdf` in `data/documents/` or supply a valid path. Extraction and 
 
 ## Web interface
 
-Start Streamlit from the project root:
+The setup and startup launchers open LUCY's Streamlit web interface. If your browser does not open automatically, visit <http://localhost:8501>.
+
+If you prefer to run Streamlit directly, use the Python executable in the environment created by setup:
+
+**Windows (new Python 3.14 installation):**
 
 ```powershell
-python -m streamlit run src/web_app.py
+.\.venv-lucy-314\Scripts\python.exe -m streamlit run src/web_app.py
 ```
 
-Open **http://localhost:8501** if the browser does not open automatically. The Streamlit interface supports document/image uploads, URL entry, indexing, questions, **persistent SQLite-backed chats**, switching between chats, clearing/deleting saved chats, clickable citations, source previews, and a conversation-memory diagnostics panel. Questions run through the LangGraph router; conversation history and summaries are kept separately for each chat.
+If Windows setup used `.venv-lucy` instead, substitute `.venv-lucy` in that command.
 
-On **Windows**, double-click `START_APP.vbs` to launch without a visible terminal (requires `.venv`), and use `STOP_APP.vbs` to request shutdown.
+**macOS or Ubuntu:**
 
-On **macOS**, the repository includes `START_APP.command` and `STOP_APP.command`. After setting executable permissions (`chmod +x START_APP.command STOP_APP.command`) and preparing `.venv`, these launch/stop the Streamlit service. These macOS launchers are development conveniences, not signed applications. On Linux, run Streamlit from the terminal using the command above.
+```bash
+.venv-lucy/bin/python -m streamlit run src/web_app.py
+```
+
+The web interface supports document/image uploads, URL entry, indexing, questions, persistent SQLite-backed chats, switching between chats, clearing/deleting saved chats, clickable citations, source previews, and a conversation-memory diagnostics panel. Questions run through the LangGraph router; conversation history and summaries are kept separately for each chat.
 
 The web interface is intended for **trusted local use**, not exposure directly to the public internet. Conversations are saved locally and persist after closing the browser until deleted.
 
 ## Command-line questions
 
 ```powershell
+
 python .\src\query_documents.py
 ```
 
 Example questions (which require the relevant documents to have been indexed):
 
 ```text
+
 What is retrieval-augmented generation?
 According to Table II of the OWASP vulnerability dataset paper, list all OWASP categories and their most affected programming languages.
 What does Figure 3 in agentchaos.pdf show?
@@ -211,6 +256,7 @@ When sufficient evidence exists, the output includes an answer and source refere
 ### Core regression tests (offline)
 
 ```powershell
+
 python .\src\test_rag_core_regression.py
 ```
 
@@ -219,6 +265,7 @@ The core suite tests LangGraph dispatch with a fake backend, cumulative memory b
 ### PDF/table fixture regression and live tests
 
 ```powershell
+
 python .\src\test_rag_regression.py
 python .\src\test_rag_regression.py --live
 ```
@@ -230,6 +277,7 @@ These older tests rely on local extracted-table fixtures; `--live` additionally 
 Evaluate evidence retrieval:
 
 ```powershell
+
 python .\src\evaluate_retrieval_quality.py
 ```
 
@@ -238,6 +286,7 @@ Generated reports are saved under `data/retrieval_tests/`. Some evaluator tests 
 Enable optional per-stage profiling:
 
 ```powershell
+
 $env:RAG_PROFILE = "1"
 python .\src\query_documents.py
 ```
@@ -251,24 +300,39 @@ Local documents, images, ChromaDB records, extracted figures/tables, generated r
 ## Known limitations
 
 - PDF layouts, figures, tables, and vision-generated descriptions may be incomplete or inaccurate.
+
 - Structural validation does not certify every extracted cell against the original PDF.
+
 - Chunking is simple; neighboring-chunk expansion reduces but does not eliminate missing-context problems.
+
 - Grounded answers can still be incomplete or incorrect; matched sources are not guaranteed claim-level verification.
+
 - Some citation links can only open unverified source previews when exact text or regions cannot be matched.
+
 - Ambiguous table references across documents may require a clearer source name.
+
 - Existing ChromaDB records are not automatically updated when source files change or are removed.
+
 - LangGraph routing uses heuristics and may misclassify ambiguous questions or context-dependent requests.
+
 - Chat memory uses recent messages, append-only summaries, and retained original messages. Summaries and recall can omit or misinterpret details; the memory length is bounded.
+
 - Local model inference may be slow on CPU-only machines.
-- Install and launcher behavior have not been comprehensively verified across Windows, macOS, and Linux; there is no packaged installer yet.
+
+- Setup and application startup have been tested on Windows and macOS Apple Silicon, but the macOS restart launcher, Ubuntu setup, and Linux desktop launcher still need validation; there is no packaged installer yet.
 
 ## Roadmap
 
 - Stronger claim-level citation verification, answer grounding, and uncertainty calibration.
+
 - Safer refresh and deletion of outdated indexed records.
+
 - More figure/table regression coverage and multi-document retrieval tests.
+
 - Stronger evaluations of factual answer quality and long-conversation recall.
+
 - Improved layout extraction and ambiguity handling.
+
 - Beta desktop packaging for Windows, macOS, and Linux after dependency and installation testing.
 
 ## Project status
