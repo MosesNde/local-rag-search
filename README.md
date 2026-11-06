@@ -335,6 +335,14 @@ Local documents, images, ChromaDB records, extracted figures/tables, generated r
 
 - Beta desktop packaging for Windows, macOS, and Linux after dependency and installation testing.
 
+## License
+
+This project is licensed under the **Apache License, Version 2.0**.
+
+See the [LICENSE](LICENSE) file for the full license and [NOTICE](NOTICE) for copyright information.
+
+Third-party dependencies and AI models are subject to their respective licenses.
+
 ## Project status
 
 **Functional research prototype:** CLI and Streamlit access, local multimodal indexing, structured PDF retrieval, persistent conversations, LangGraph routing, cumulative memory, source evidence viewing, and automated regression tests. The application is still run as a local Streamlit service; installable desktop distributions are future work.
